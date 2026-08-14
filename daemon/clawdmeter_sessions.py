@@ -213,10 +213,11 @@ def elide_label(label, max_chars):
     discriminator — `clawdmeter-36` and `clawdmeter-2c` must stay distinct."""
     if len(label) <= max_chars:
         return label
-    if max_chars < 3:
+    if max_chars < len(ELLIPSIS):
         return label[:max_chars]
-    tail = (max_chars - 1) // 2
-    head = (max_chars - 1) - tail
+    remaining = max_chars - len(ELLIPSIS)
+    tail = (remaining + 1) // 2   # round up: keep the trailing discriminator
+    head = remaining - tail
     return label[:head] + ELLIPSIS + label[len(label) - tail:]
 
 

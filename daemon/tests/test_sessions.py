@@ -301,7 +301,9 @@ def test_elide_middle_preserves_trailing_discriminator():
     assert len(a) == 8 and len(b) == 8
     assert a != b                       # must not both become "clawdmete…"
     assert a.endswith("-36") and b.endswith("-2c")
-    assert a.startswith("claw") and mod.ELLIPSIS in a
+    # ELLIPSIS is 3 ASCII chars (not a single "…"), so at max_chars=8 there's
+    # only 2 head chars left once the 3-char discriminator tail is kept.
+    assert a.startswith("cl") and mod.ELLIPSIS in a
 
 
 def test_elide_floor_is_eight_chars():
