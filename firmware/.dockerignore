@@ -1,0 +1,6 @@
+# This Dockerfile has no COPY — pio-docker.sh bind-mounts the source at run
+# time instead — so nothing here is ever used as build context. Ignoring it
+# anyway keeps `docker build` from needlessly uploading the local PlatformIO
+# build cache (can reach hundreds of MB) as context on every rebuild.
+.pio/
+.git/
