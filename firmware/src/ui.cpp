@@ -1721,36 +1721,40 @@ static void update_view_state(void) {
     // stale RESTING/chat view — see the BLE-vs-serial view-state fix on main.
     const bool fresh = data_received && data_ok && (now - last_data_ms) < DATA_FRESH_MS;
     int v;
-    if (!s_ble_connected) {
-        v = 0;  // pairing hint
-    }
 #if BOARD_HAS_SESSION_VIEWS
-    else if (board_caps().has_session_views && s_any_waiting) {
+    if (board_caps().has_session_views && s_any_waiting) {
         // A waiting chat pins the view (§2.1): it bypasses the freshness
         // check and the linger timer. A session that has sat on a permission
         // prompt for forty minutes is precisely the case this feature exists
         // for, and a plain inactivity timeout would hide it.
         v = (s_live_count <= 1) ? 3 : 4;
-    }
+    } else
 #endif
-    else if (!fresh) {
+    if (fresh) {
+        // Live data — from BLE or USB serial — takes priority over the
+        // !s_ble_connected check below: serial doesn't set s_ble_connected,
+        // so gating on it here would strand a serial-only setup on the
+        // pairing hint forever even with fresh data in hand.
+#if BOARD_HAS_SESSION_VIEWS
+        if (board_caps().has_session_views && s_live_count == 1) {
+            v = 3;  // ONE CHAT (§1.3)
+        } else if (board_caps().has_session_views && s_live_count >= 2) {
+            v = 4;  // SEVERAL CHATS (§1.4)
+        } else if (board_caps().has_session_views && s_chats_linger &&
+                   (now - s_chats_gone_ms) < CHAT_LINGER_MS) {
+            v = s_linger_view;  // hold the chat view after the last chat closed (§2.1)
+        } else
+#endif
+        {
+#if BOARD_HAS_SESSION_VIEWS
+            s_chats_linger = false;  // linger expired (or never armed)
+#endif
+            v = 2;  // RESTING — live quota panels
+        }
+    } else if (!s_ble_connected) {
+        v = 0;  // pairing hint
+    } else {
         v = 1;  // idle / Zzz
-    }
-#if BOARD_HAS_SESSION_VIEWS
-    else if (board_caps().has_session_views && s_live_count == 1) {
-        v = 3;  // ONE CHAT (§1.3)
-    } else if (board_caps().has_session_views && s_live_count >= 2) {
-        v = 4;  // SEVERAL CHATS (§1.4)
-    } else if (board_caps().has_session_views && s_chats_linger &&
-               (now - s_chats_gone_ms) < CHAT_LINGER_MS) {
-        v = s_linger_view;  // hold the chat view after the last chat closed (§2.1)
-    }
-#endif
-    else {
-#if BOARD_HAS_SESSION_VIEWS
-        s_chats_linger = false;  // linger expired (or never armed)
-#endif
-        v = 2;  // RESTING — live quota panels
     }
     if (v == view_state) return;
     Serial.printf("view_state: %d -> %d (live=%d waiting=%d fresh=%d)\n",
@@ -1844,7 +1848,11 @@ void ui_tick_anim(void) {
 
     // Status text by priority. Whimsical messages only when connected & settled.
     const char* text;
-    if (!s_ble_connected) {
+    if (view_state == 2 && !s_ble_connected) {
+        text = (now - last_data_ms < 5000)
+            ? "Updated"
+            : anim_messages[anim_msg_idx];
+    } else if (!s_ble_connected) {
         text = "Waiting";              // advertising / waiting for a host connection
     } else if (view_state == 1) {      // idle — alternate so it reads as alive AND data-less
         text = (anim_msg_idx & 1) ? "No data" : "Listening";
