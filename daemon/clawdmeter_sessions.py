@@ -352,6 +352,38 @@ def read_context_from_transcript(path):
     return (None, None)
 
 
+def read_custom_title_from_transcript(path):
+    """Newest "custom-title" record's title - the name the user set by
+    renaming the chat in the editor's session list. The harness re-emits
+    this event repeatedly (not just once), so a tail read reliably picks up
+    the latest one without needing to scan the whole file. Returns None
+    when unreadable/absent/blank."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > TRANSCRIPT_TAIL_BYTES:
+                fh.seek(size - TRANSCRIPT_TAIL_BYTES)
+                fh.readline()  # discard the partial line
+            data = fh.read()
+    except OSError:
+        return None
+
+    for line in reversed(data.decode("utf-8", "replace").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "custom-title":
+            continue
+        title = clean_prompt_label(rec.get("customTitle"))
+        if title:
+            return title
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Session roster (liveness + names) — §4.2
 # ---------------------------------------------------------------------------
@@ -433,7 +465,7 @@ class Session:
         "session_id", "sid", "state", "state_since", "last_event_at",
         "roster_name", "cwd", "transcript_path", "current_tool", "open_tools",
         "nagents", "tdone", "ttotal", "ctx", "tok", "model", "missing_since",
-        "first_prompt",
+        "first_prompt", "custom_title",
     )
 
     def __init__(self, session_id, now):
@@ -459,8 +491,15 @@ class Session:
         # the cost of prompt text becoming device-visible (opt-in tradeoff,
         # see SESSIONS.md's privacy note).
         self.first_prompt = None
+        # User-set chat title (renamed in the editor's session list), read
+        # from the transcript's "custom-title" events - see
+        # read_custom_title_from_transcript(). Takes priority over
+        # first_prompt: an intentional rename beats an inferred label.
+        self.custom_title = None
 
     def label(self):
+        if self.custom_title:
+            return self.custom_title
         if self.first_prompt:
             return self.first_prompt
         if self.roster_name:
@@ -641,6 +680,9 @@ class SessionTable:
         # by the window. Forced to -1 whenever ctx is -1 so the pair can never
         # disagree on the wire.
         sess.tok = tokens_k(tokens) if sess.ctx != -1 else -1
+        title = read_custom_title_from_transcript(path)
+        if title:
+            sess.custom_title = title
 
     def _guess_transcript(self, sess):
         """Fallback when no hook carried transcript_path:

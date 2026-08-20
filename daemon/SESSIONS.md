@@ -134,13 +134,17 @@ rosters and transcripts across several Claude config dirs.
 
 - **Privacy/security.** Hook payloads contain prompt and response text, so the
   listener binds `127.0.0.1` only and rejects non-loopback peers. The one
-  exception to "no payload text reaches the device": each session's label
-  prefers its first user prompt (cleaned + capped at 80 chars, see
-  `clean_prompt_label()`) over the host's generic "`<dir>-xx`" name, so
-  whatever you type first is what shows up on the device's screen — visible
-  to anyone near it. Falls back to the directory-derived name if the prompt
-  is empty/unavailable. Everything else (state, counts, model, tool) stays
-  metadata-only.
+  exception to "no payload text reaches the device": each session's label,
+  in priority order, is (1) a custom title you set by renaming the chat in
+  the editor's session list, (2) the first user prompt (cleaned + capped at
+  80 chars, see `clean_prompt_label()`), (3) the host's generic "`<dir>-xx`"
+  name, (4) the raw session id. A rename isn't stored in the hook payloads
+  or the session roster — the editor writes it as a `custom-title` event
+  directly into the transcript file, re-emitted repeatedly, so a tail read
+  (same `read_context_from_transcript` window) reliably picks up the latest
+  one on the next `SessionStart`/`Stop`/`PostCompact` hook. Whichever of
+  these wins, it's visible to anyone near the device's screen. Everything
+  else (state, counts, model, tool) stays metadata-only.
 - **Liveness.** Sessions are considered alive while their roster entry
   (`<config-dir>/sessions/<pid>.json`) points at a running process — not on an
   activity timeout, so a chat parked on a permission prompt survives

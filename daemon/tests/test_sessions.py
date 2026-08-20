@@ -16,8 +16,8 @@ from daemon.clawdmeter_sessions import (
     STATE_RUNNING_TOOL, STATE_COMPACTING, STATE_WAITING_PERMISSION,
     STATE_WAITING_QUESTION, STATE_WAITING_INPUT, STATE_ERROR,
     SessionTable, clean_prompt_label, compute_window, context_percent,
-    elide_label, encode_payload, fit_payload, model_code, state_bucket,
-    tokens_k, tool_code,
+    elide_label, encode_payload, fit_payload, model_code,
+    read_custom_title_from_transcript, state_bucket, tokens_k, tool_code,
 )
 
 SID = "a3f10c2e-0000-4000-8000-000000000001"
@@ -443,6 +443,38 @@ def test_context_unknown_when_transcript_missing():
     t.handle_event(ev("SessionStart", transcript_path="/nonexistent/nope.jsonl"))
     assert sess(t).ctx == -1
     assert sess(t).tok == -1    # tok is -1 exactly when ctx is -1
+
+
+def test_read_custom_title_picks_the_latest(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    lines = [
+        {"type": "custom-title", "customTitle": "First name"},
+        {"type": "user", "message": {"content": "hi"}},
+        {"type": "custom-title", "customTitle": "Renamed again"},
+    ]
+    transcript.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+    assert read_custom_title_from_transcript(str(transcript)) == "Renamed again"
+
+
+def test_read_custom_title_absent_or_blank(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "message": {}}) + "\n")
+    assert read_custom_title_from_transcript(str(transcript)) is None
+
+    blank = tmp_path / "blank.jsonl"
+    blank.write_text(json.dumps({"type": "custom-title", "customTitle": "   "}) + "\n")
+    assert read_custom_title_from_transcript(str(blank)) is None
+
+
+def test_custom_title_label_beats_first_prompt_and_roster(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "Session 1"}) + "\n"
+    )
+    t = make_table()
+    t.handle_event(ev("SessionStart", transcript_path=str(transcript)))
+    t.handle_event(ev("UserPromptSubmit", prompt="an unrelated first prompt"))
+    assert sess(t).label() == "Session 1"
 
 
 # ---------------------------------------------------------------------------
