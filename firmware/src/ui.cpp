@@ -644,6 +644,7 @@ static lv_image_dsc_t icon_agents_dsc, icon_agents_small_dsc;
 // Resolver inputs (§2.1), fed by ui_update_sessions()
 static uint8_t  s_live_count    = 0;      // rows in the last received list
 static bool     s_any_waiting   = false;  // any row in the waiting bucket
+static bool     s_any_active    = false;  // any row not idle (working or waiting)
 static bool     s_focus_waiting = false;  // rows[0] waiting → status line hides
 static bool     s_chats_linger  = false;  // holding a chat view after the last chat closed
 static uint32_t s_chats_gone_ms = 0;
@@ -1018,13 +1019,17 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
 
     // Scroll only while the chat is doing something; an idle chat's name
     // sits parked at the start instead of drawing the eye with motion that
-    // has nothing to report. lv_label_set_long_mode() always restarts the
-    // animation (no same-value guard in LVGL), so only call it on a change.
+    // has nothing to report. Plain CLIP, not DOT: this is a "paused", not
+    // "shortened", state — it shows as much of the real name as fits with a
+    // hard edge, no "..." implying the rest is gone forever, since the full
+    // name resumes scrolling the moment the chat wakes back up.
+    // lv_label_set_long_mode() always restarts the animation (no
+    // same-value guard in LVGL), so only call it on a change.
     const bool want_scroll = (bucket != SESSION_BUCKET_IDLE);
     if (want_scroll != c->name_scrolling) {
         c->name_scrolling = want_scroll;
         lv_label_set_long_mode(c->lbl_name,
-            want_scroll ? LV_LABEL_LONG_SCROLL : LV_LABEL_LONG_DOT);
+            want_scroll ? LV_LABEL_LONG_SCROLL : LV_LABEL_LONG_CLIP);
     }
     set_label_if_changed(c->lbl_name, r->label);
 
@@ -1381,8 +1386,23 @@ static void build_session_views(lv_obj_t* parent) {
     // sub-view alone drops the bottom margin, because clipped content tapers
     // out through the fade band below instead of hitting a hard cut (§2.5's
     // mid-card affordance, softened; the 4th card shows 62 of 80 px, the last
-    // 60 of them fading). Side margins stay. No scrolling in this round —
-    // ordering guarantees everything urgent is above the fold.
+    // 60 of them fading). Side margins stay. Vertical touch scroll reaches
+    // whatever's below the fold — attention-first ordering (the host
+    // pre-sorts §5) keeps the most urgent chats visible without scrolling,
+    // but with enough sessions open the rest would otherwise be permanently
+    // unreachable, not just momentarily off-screen.
+    //
+    // Native LVGL scrolling (LV_OBJ_FLAG_SCROLLABLE): a hand-rolled version
+    // driven from a card's bubbled LV_EVENT_PRESSING (to flip the direction
+    // — LVGL has no per-object flag for that; it's baked into the generic
+    // indev press handler in lv_indev_scroll.c) didn't actually move
+    // anything on hardware and wasn't worth debugging blind. Native scroll's
+    // target resolution walks up from the touched point looking for the
+    // nearest LV_OBJ_FLAG_SCROLLABLE ancestor directly — a separate,
+    // simpler, battle-tested path that doesn't depend on event bubbling at
+    // all, which is likely exactly why it's the reliable option here.
+    // Direction follows LVGL's standard convention (drag up reveals lower
+    // content) for now.
     const int list_y = L.content_y + CHAT_ROW_H + CHAT_ROW_GAP + 4;  // #129 ch_list_y
     const int list_h = L.scr_h - list_y;
     cards_cont = lv_obj_create(chats_group);
@@ -1391,7 +1411,9 @@ static void build_session_views(lv_obj_t* parent) {
     lv_obj_set_style_bg_opa(cards_cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(cards_cont, 0, 0);
     lv_obj_set_style_pad_all(cards_cont, 0, 0);
-    lv_obj_clear_flag(cards_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cards_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(cards_cont, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(cards_cont, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_add_flag(cards_cont, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     for (auto& c : chat_cards) {
@@ -1653,23 +1675,31 @@ void ui_update(const UsageData* data) {
 #endif
 }
 
-// The `✻` status line yields when it has nothing to say (§2.3): hidden
-// outright once every chat has closed (nothing left to be lively about), and
-// on either session view once a chat is waiting on you (that already has its
-// own pulsing indicator — a second animation competing for attention is
-// noise, not signal). Driven by s_any_waiting/s_focus_waiting rather than a
-// per-row working/idle bucket: those two are already the view resolver's own
-// stable inputs, so this can't flap out of step with them. An
-// activity-derived version of this flickered in testing — hook events land
-// in a burst during real tool use, so a bucket can bounce through idle and
-// back inside one payload's turnaround.
+// The `✻` status line doubles as the connection-state readout (pairing/
+// idle/RESTING screens: "Waiting"/"Connected"/whimsical — see
+// ui_tick_anim()) and, on the session views, a "something's happening"
+// flourish. Those are two different jobs: on views 0/1/2 it must always be
+// visible so BLE state stays legible, regardless of session data — only on
+// the session views themselves does it yield when it has nothing to say
+// (every chat closed or idle, or a chat's own pulsing indicator already has
+// your attention).
+//
+// On SEVERAL-CHATS this is keyed off s_any_active (any row not idle) rather
+// than the single-session view's s_focus_waiting, because "is anyone doing
+// anything" is exactly the question this line answers there — showing it
+// over an all-idle list read as false liveliness. A near-identical
+// bucket-driven version was blamed for a "whole screen flickering" report
+// once before and reverted to s_any_waiting-only; root cause was never
+// conclusively pinned down (several other things changed the same session),
+// and the daemon's own state machine holds RUNNING_TOOL steady between a
+// turn's tool calls rather than dipping through IDLE, so it shouldn't
+// actually flap. Watch for a recurrence before assuming this is settled.
 static void apply_anim_visibility(void) {
     if (!lbl_anim) return;
     bool hide = false;
 #if BOARD_HAS_SESSION_VIEWS
-    if (board_caps().has_session_views && s_live_count == 0) hide = true;
-    else if (view_state == 4) hide = s_any_waiting;
-    else if (view_state == 3) hide = s_focus_waiting;
+    if (view_state == 4) hide = (s_live_count == 0) || s_any_waiting || !s_any_active;
+    else if (view_state == 3) hide = (s_live_count == 0) || s_focus_waiting;
 #endif
     if (hide) lv_obj_add_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
     else      lv_obj_clear_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
@@ -1735,7 +1765,16 @@ static void update_view_state(void) {
     if (v == 3 || v == 4) {
         lv_label_set_text(lbl_title, "Sessions");
         if (v == 3) lv_obj_clear_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
-        else        lv_obj_clear_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
+        else {
+            lv_obj_clear_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
+            // Freshly entering the list (not just re-laying it out while
+            // already on it — that path doesn't reach here, see the early
+            // return above): start scrolled to the top, where the
+            // attention-first sort put whatever's most urgent. Otherwise a
+            // scroll position left over from a previous visit could open
+            // straight onto whatever happened to be there before.
+            if (cards_cont) lv_obj_scroll_to_y(cards_cont, 0, LV_ANIM_OFF);
+        }
     } else {
         // Leaving the session view: restore the title now instead of
         // waiting up to 60s for the next clock minute-tick to overwrite it.
@@ -1879,9 +1918,12 @@ void ui_update_sessions(const SessionList* list) {
     const uint8_t prev_count = s_live_count;
     s_live_count = list->count;
     s_any_waiting = false;
-    for (int i = 0; i < list->count; i++)
-        if (session_bucket(list->rows[i].state) == SESSION_BUCKET_WAITING)
-            s_any_waiting = true;
+    s_any_active = false;
+    for (int i = 0; i < list->count; i++) {
+        const int b = session_bucket(list->rows[i].state);
+        if (b == SESSION_BUCKET_WAITING) s_any_waiting = true;
+        if (b != SESSION_BUCKET_IDLE)    s_any_active = true;
+    }
 
     if (list->count == 0) {
         if (prev_count > 0 && (view_state == 3 || view_state == 4)) {
