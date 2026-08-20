@@ -38,3 +38,35 @@ file must be patched for LVGL 9 compatibility:
 4. Add `.fallback = NULL`, `.user_data = NULL` to the font struct
 
 Without these patches, fonts compile but render as invisible.
+
+## One-off glyphs via `.fallback` (e.g. font_sinhala_18.c)
+
+The bitmap fonts above only bake in an explicit `-r` codepoint range — nothing
+outside it renders (blank/tofu), and mixing glyphs from two source fonts into
+one `lv_font_conv` run isn't supported. For a single extra character that the
+main font's source doesn't cover (e.g. `font_mono_18`'s DejaVu Sans Mono has
+no Sinhala glyphs), it's cheaper to generate a tiny standalone font with just
+that codepoint and chain it on via LVGL's built-in `lv_font_t.fallback` field
+— `lv_font_get_glyph_dsc()` (`lv_font.c`) walks the `fallback` chain
+automatically, no per-label wiring needed:
+
+```bash
+lv_font_conv --font NotoSansSinhala.ttf -r 0x0D9E \
+  --size 18 --format lvgl --bpp 4 --no-compress \
+  -o firmware/src/font_sinhala_18.c --lv-include "lvgl.h"
+```
+
+Apply the same 4 LVGL 9 patches above, then **hand-edit the *primary* font's
+`.c` file** (`font_mono_18.c` in this case) to point at it — this second edit
+isn't part of the regen recipe and isn't scripted, so redo it if
+`font_mono_18` ever gets regenerated:
+
+```c
+extern const lv_font_t font_sinhala_18;   // near the top, after the FONT_MONO_18 guard
+...
+.fallback = &font_sinhala_18,             // was NULL, in the font_mono_18 struct
+```
+
+Only `font_mono_18` (the CYD's small-screen tier) got this treatment — large
+boards' `font_mono_32` still shows tofu for the same glyph until it gets the
+same patch.

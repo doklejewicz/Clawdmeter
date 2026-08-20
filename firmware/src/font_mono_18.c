@@ -16,6 +16,12 @@
 
 #if FONT_MONO_18
 
+/* Hand-patched addition (not part of the lv_font_conv regen recipe in
+ * docs/fonts.md — redo this after regenerating): fallback to a one-glyph
+ * font for U+0D9E "ඞ", which DejaVu Sans Mono doesn't cover. See
+ * font_sinhala_18.c. */
+extern const lv_font_t font_sinhala_18;
+
 /*-----------------
  *    BITMAPS
  *----------------*/
@@ -1110,7 +1116,7 @@ const lv_font_t font_mono_18 = {
     .underline_position = -1,
     .underline_thickness = 1,
     .dsc = &font_dsc,
-    .fallback = NULL,
+    .fallback = &font_sinhala_18,
     .user_data = NULL,
 };
 
