@@ -50,7 +50,7 @@ already Python; see "macOS / Windows" below).
    ```ini
    hook_port = 45999
    # context_window_k =          # optional: pin the context window (kilotokens)
-   # sessions_budget_bytes = 180 # optional: payload byte budget
+   # sessions_budget_bytes = 400 # optional: payload byte budget
    ```
 
 2. **Hook block** — merge into `~/.claude/settings.json` (and any other Claude
@@ -141,7 +141,7 @@ fields only ever go on the end.
 | --- | --- | --- |
 | `hook_port` | unset | Loopback port for the hook listener. **Unset = feature off** — the sidecar exits, the daemon sends nothing. |
 | `context_window_k` | unset | Pin the context window in kilotokens (e.g. `200`, `1000`). Blank = heuristic: 200k default, 1M on a `[1m]` model marker, snap up to the next 1M multiple when observed usage exceeds the assumption. A pinned value disables the snap-up. |
-| `sessions_budget_bytes` | `180` | Byte budget for the fitted payload. Labels middle-elide down to an 8-char floor first, then the least-urgent rows drop from the tail. Keep below the BLE MTU the device negotiates. |
+| `sessions_budget_bytes` | `400` | Byte budget for the fitted payload. Labels truncate (prefix + "...") down to an 8-char floor first, then the least-urgent rows drop from the tail. Keep below the BLE MTU the device negotiates (the firmware requests 517; 400 leaves headroom under that). |
 
 The sidecar also honors `config_dirs` (shared with the daemons) to find session
 rosters and transcripts across several Claude config dirs.
@@ -152,15 +152,23 @@ rosters and transcripts across several Claude config dirs.
   listener binds `127.0.0.1` only and rejects non-loopback peers. The one
   exception to "no payload text reaches the device": each session's label,
   in priority order, is (1) a custom title you set by renaming the chat in
-  the editor's session list, (2) the first user prompt (cleaned + capped at
-  80 chars, see `clean_prompt_label()`), (3) the host's generic "`<dir>-xx`"
-  name, (4) the raw session id. A rename isn't stored in the hook payloads
-  or the session roster — the editor writes it as a `custom-title` event
-  directly into the transcript file, re-emitted repeatedly, so a tail read
-  (same `read_context_from_transcript` window) reliably picks up the latest
-  one on the next `SessionStart`/`Stop`/`PostCompact` hook. Whichever of
-  these wins, it's visible to anyone near the device's screen. Everything
-  else (state, counts, model, tool) stays metadata-only.
+  the editor's session list, (2) an `ai-title` — a short summary the editor
+  generates on its own as the conversation develops, refined over time (e.g.
+  "Test for second session" → "ui.cpp test for second session") — nobody
+  typed this, but it's far more useful than the raw first message, (3) the
+  first user prompt (cleaned + capped at 80 chars, see `clean_prompt_label()`),
+  (4) a non-generic roster name if the host ever supplies one directly, (5)
+  the host's generic "`<dir>-xx`" name, (6) the raw session id. Neither a
+  rename nor an ai-title is stored in the hook payloads or the session
+  roster — the editor writes them as `custom-title`/`ai-title` events
+  directly into the transcript file, both re-emitted repeatedly, so a tail
+  read (same `read_context_from_transcript` window) reliably picks up the
+  latest wording on the next `SessionStart`/`Stop`/`PostCompact` hook.
+  Whichever of these wins, it's visible to anyone near the device's screen.
+  A session with none of the above and no context data yet (a window opened
+  but never used) is filtered from the payload entirely rather than shown as
+  a bare directory name — see `Session.is_placeholder()`. Everything else
+  (state, counts, model, tool) stays metadata-only.
 - **Liveness.** Sessions are considered alive while their roster entry
   (`<config-dir>/sessions/<pid>.json`) points at a running process — not on an
   activity timeout, so a chat parked on a permission prompt survives

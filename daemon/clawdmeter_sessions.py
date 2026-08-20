@@ -88,7 +88,15 @@ TOOL_CODES = {
 # Tunables
 # ---------------------------------------------------------------------------
 
-DEFAULT_BUDGET_BYTES = 180   # conservative fit target; see sessions_budget_bytes
+DEFAULT_BUDGET_BYTES = 400   # see sessions_budget_bytes. Was 180 - too tight in
+                              # practice: with several real sessions competing for
+                              # the same budget, elide_label() squeezed every label
+                              # down toward its 8-char floor and fit_payload()
+                              # sometimes dropped rows outright before they ever
+                              # reached the device. 400 leaves real headroom under
+                              # the ~514-byte ceiling of the firmware's negotiated
+                              # 517-byte BLE MTU (ble.cpp's setMTU(517), minus ~3
+                              # bytes of ATT write overhead).
 LABEL_FLOOR = 8              # labels never elide below this many characters
 # ASCII on purpose: the firmware's Styrene fonts cover 32..126 only, so a real
 # U+2026 renders as tofu on the device. Same UTF-8 byte count (3), so the
@@ -244,16 +252,22 @@ def clean_prompt_label(text):
 
 
 def elide_label(label, max_chars):
-    """Middle-elide to max_chars characters, preserving the trailing
-    discriminator — `clawdmeter-36` and `clawdmeter-2c` must stay distinct."""
+    """Truncate to max_chars characters, keeping the start and appending
+    "..." — plain prefix truncation. Used to middle-elide instead, keeping a
+    trailing discriminator so e.g. "clawdmeter-36" and "clawdmeter-2c"
+    stayed visually distinct — that mattered when the host-derived
+    "<dir>-xx" name was the common label. Today's labels are usually a real
+    prompt or title, where the identifying part is the beginning, not a
+    suffix; true row identity for the firmware's card matching is `sid`
+    (wire index 0) regardless of what the label text says, so two rows
+    showing an identical truncated prefix still won't be confused with each
+    other by the UI itself — only visually harder to tell apart at a glance,
+    same as any other rare same-prefix collision."""
     if len(label) <= max_chars:
         return label
-    if max_chars < len(ELLIPSIS):
+    if max_chars <= len(ELLIPSIS):
         return label[:max_chars]
-    remaining = max_chars - len(ELLIPSIS)
-    tail = (remaining + 1) // 2   # round up: keep the trailing discriminator
-    head = remaining - tail
-    return label[:head] + ELLIPSIS + label[len(label) - tail:]
+    return label[:max_chars - len(ELLIPSIS)] + ELLIPSIS
 
 
 def encode_payload(rows):
@@ -431,12 +445,11 @@ def read_first_prompt_from_transcript(path):
     return None
 
 
-def read_custom_title_from_transcript(path):
-    """Newest "custom-title" record's title - the name the user set by
-    renaming the chat in the editor's session list. The harness re-emits
-    this event repeatedly (not just once), so a tail read reliably picks up
-    the latest one without needing to scan the whole file. Returns None
-    when unreadable/absent/blank."""
+def _read_latest_transcript_event_field(path, event_type, field):
+    """Newest `event_type` record's `field`, tail-read. Both custom-title and
+    ai-title are re-emitted repeatedly by the harness (not just once), so
+    scanning from the end reliably finds the latest wording without reading
+    the whole file. Returns None when unreadable/absent/blank."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -455,12 +468,28 @@ def read_custom_title_from_transcript(path):
             rec = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(rec, dict) or rec.get("type") != "custom-title":
+        if not isinstance(rec, dict) or rec.get("type") != event_type:
             continue
-        title = clean_prompt_label(rec.get("customTitle"))
-        if title:
-            return title
+        value = clean_prompt_label(rec.get(field))
+        if value:
+            return value
     return None
+
+
+def read_custom_title_from_transcript(path):
+    """Newest "custom-title" record's title - the name the user set by
+    renaming the chat in the editor's session list."""
+    return _read_latest_transcript_event_field(path, "custom-title", "customTitle")
+
+
+def read_ai_title_from_transcript(path):
+    """Newest "ai-title" record's title - a short summary the editor
+    generates on its own as the conversation develops (refined over time,
+    e.g. "Test for second session" -> "ui.cpp test for second session" -
+    reading the tail keeps picking up the latest wording). Distinct from
+    custom-title: nobody typed this, but it's still far more useful than
+    the raw first prompt or a generic "<dir>-xx" name."""
+    return _read_latest_transcript_event_field(path, "ai-title", "aiTitle")
 
 
 # ---------------------------------------------------------------------------
@@ -542,9 +571,9 @@ def load_roster(config_dirs):
 class Session:
     __slots__ = (
         "session_id", "sid", "state", "state_since", "last_event_at",
-        "roster_name", "cwd", "transcript_path", "current_tool", "open_tools",
+        "roster_name", "roster_name_source", "cwd", "transcript_path", "current_tool", "open_tools",
         "nagents", "tdone", "ttotal", "ctx", "tok", "model", "effort", "missing_since",
-        "first_prompt", "first_prompt_seen", "custom_title",
+        "first_prompt", "first_prompt_seen", "custom_title", "ai_title",
     )
 
     def __init__(self, session_id, now):
@@ -554,6 +583,12 @@ class Session:
         self.state_since = now
         self.last_event_at = now
         self.roster_name = None
+        # The roster's own account of how it got that name: "derived" is the
+        # boring cwd-based "<dir>-xx" placeholder every session starts with;
+        # anything else (the editor updates this once it generates a real
+        # title, observed values TBD - not "derived" is the signal) means
+        # the host already did better than we could. See label()'s priority.
+        self.roster_name_source = None
         self.cwd = None
         self.transcript_path = None
         self.current_tool = None   # last tool NAME; survives PostToolUse
@@ -582,12 +617,28 @@ class Session:
         # User-set chat title (renamed in the editor's session list), read
         # from the transcript's "custom-title" events - see
         # read_custom_title_from_transcript(). Takes priority over
-        # first_prompt: an intentional rename beats an inferred label.
+        # everything: an intentional rename beats any inferred label.
         self.custom_title = None
+        # Editor-generated summary title (nobody typed this - see
+        # read_ai_title_from_transcript()), refined as the conversation
+        # develops. Ranks above first_prompt: a short "Fix the login bug"
+        # beats the raw first message every time it's available, which is
+        # usually within the first few turns.
+        self.ai_title = None
 
     def label(self):
         if self.custom_title:
             return self.custom_title
+        if self.ai_title:
+            return self.ai_title
+        # A non-"derived" roster name means the host itself produced a
+        # better title than the raw first prompt - trust it over
+        # first_prompt. A "derived" one is just the generic "<dir>-xx"
+        # placeholder and stays below first_prompt, same as always. (In
+        # practice ai_title above is the confirmed mechanism for this; this
+        # tier is a fallback in case the roster ever surfaces one directly.)
+        if self.roster_name and self.roster_name_source not in (None, "derived"):
+            return self.roster_name
         if self.first_prompt:
             return self.first_prompt
         if self.roster_name:
@@ -597,6 +648,25 @@ class Session:
             if base:
                 return base
         return self.session_id[:8]
+
+    def is_placeholder(self):
+        """A window opened but never actually used: idle (never mid-turn -
+        anything that has ever reached THINKING/WORKING/WAITING is real,
+        regardless of its current state now), nothing better than the
+        generic host-derived "<dir>-xx" name available, and no context data
+        yet (ctx == -1 - the transcript has never been read, meaning no
+        prompt was ever typed and nothing to summarize). All three together,
+        not just a generic name alone, so a real session that happens to be
+        idle right now - or hasn't gotten a nice label or a context read
+        yet for some other reason - doesn't get hidden too. Filtered out of
+        rows() entirely instead of shown as a bare directory name - there's
+        nothing informative to show yet."""
+        if self.state != STATE_IDLE:
+            return False
+        has_real_label = bool(self.custom_title) or bool(self.ai_title) or bool(self.first_prompt) or (
+            self.roster_name is not None and self.roster_name_source not in (None, "derived")
+        )
+        return not has_real_label and self.ctx == -1
 
 
 class SessionTable:
@@ -627,7 +697,8 @@ class SessionTable:
                 return self.sessions.pop(session_id, None) is not None
 
             sess = self.sessions.get(session_id)
-            if sess is None:
+            is_new = sess is None
+            if is_new:
                 sess = Session(session_id, now)
                 self.sessions[session_id] = sess
 
@@ -637,6 +708,19 @@ class SessionTable:
             cwd = payload.get("cwd")
             if isinstance(cwd, str) and cwd:
                 sess.cwd = cwd
+
+            if is_new:
+                # A session already deep in a continuous conversation when
+                # the sidecar (re)starts may never fire SessionStart/Stop/
+                # PostCompact again for a long time — its first hook here
+                # could just as easily be a PreToolUse mid-turn. Without
+                # this, _refresh_context() (which is what actually reads
+                # custom-title/ai-title/model/ctx/effort from the
+                # transcript) would never run for it at all until whatever
+                # turn happens to be in flight eventually completes.
+                # Harmless if the event IS SessionStart/Stop/PostCompact
+                # too — _apply() below will just re-read the same file.
+                self._refresh_context(sess)
 
             sess.last_event_at = now
             sess.missing_since = None  # a hook is proof of life
@@ -787,6 +871,9 @@ class SessionTable:
         title = read_custom_title_from_transcript(path)
         if title:
             sess.custom_title = title
+        ai_title = read_ai_title_from_transcript(path)
+        if ai_title:
+            sess.ai_title = ai_title
 
     def _guess_transcript(self, sess):
         """Fallback when no hook carried transcript_path:
@@ -824,8 +911,12 @@ class SessionTable:
                 if rec is not None and pid_alive(rec.get("pid"), rec.get("procStart")):
                     sess.missing_since = None
                     name = rec.get("name")
-                    if isinstance(name, str) and name and name != sess.roster_name:
+                    src = rec.get("nameSource")
+                    if isinstance(name, str) and name and (
+                        name != sess.roster_name or src != sess.roster_name_source
+                    ):
                         sess.roster_name = name
+                        sess.roster_name_source = src if isinstance(src, str) else None
                         changed = True
                 else:
                     if sess.missing_since is None:
@@ -851,6 +942,8 @@ class SessionTable:
                     name = rec.get("name")
                     if isinstance(name, str) and name:
                         sess.roster_name = name
+                        src = rec.get("nameSource")
+                        sess.roster_name_source = src if isinstance(src, str) else None
                     cwd = rec.get("cwd")
                     if isinstance(cwd, str) and cwd:
                         sess.cwd = cwd
@@ -866,11 +959,14 @@ class SessionTable:
         """Full-label rows, already sorted: (bucket, -last_event_at).
         Row: [sid, label, state, ctx, elapsed_s, model, tool, ntools,
               nagents, tdone, ttotal, tok, effort] — append-only, like the
-        codes."""
+        codes. Placeholder sessions (see Session.is_placeholder) are left
+        out entirely — they stay tracked internally (still swept for
+        liveness, still get a real row the moment they're actually used),
+        just never sent."""
         now = self.now_fn()
         with self._lock:
             ordered = sorted(
-                self.sessions.values(),
+                (s for s in self.sessions.values() if not s.is_placeholder()),
                 key=lambda s: (state_bucket(s.state), -s.last_event_at),
             )
             return [

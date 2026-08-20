@@ -17,7 +17,8 @@ from daemon.clawdmeter_sessions import (
     STATE_WAITING_QUESTION, STATE_WAITING_INPUT, STATE_ERROR,
     SessionTable, clean_prompt_label, compute_window, context_percent,
     effort_code, elide_label, encode_payload, fit_payload, model_code,
-    read_custom_title_from_transcript, read_first_prompt_from_transcript,
+    read_ai_title_from_transcript, read_custom_title_from_transcript,
+    read_first_prompt_from_transcript,
     state_bucket, tokens_k, tool_code,
 )
 
@@ -266,7 +267,8 @@ def test_elapsed_tracks_state_changes_only():
 def test_sort_waiting_working_idle():
     clock = FakeClock(0.0)
     t = make_table(clock)
-    clock.t = 100; t.handle_event(ev("SessionStart", sid=SID))                # idle
+    clock.t = 90;  t.handle_event(ev("UserPromptSubmit", sid=SID, prompt="a finished turn"))
+    clock.t = 100; t.handle_event(ev("Stop", sid=SID))                        # idle, not a placeholder
     clock.t = 200; t.handle_event(ev("UserPromptSubmit", sid=SID2))           # working
     clock.t = 50;  t.handle_event(ev("PermissionRequest", sid=SID3))          # waiting
     clock.t = 300
@@ -307,15 +309,12 @@ def test_elide_noop_when_short():
     assert elide_label("12345678", 8) == "12345678"
 
 
-def test_elide_middle_preserves_trailing_discriminator():
-    a = elide_label("clawdmeter-36", 8)
-    b = elide_label("clawdmeter-2c", 8)
-    assert len(a) == 8 and len(b) == 8
-    assert a != b                       # must not both become "clawdmete…"
-    assert a.endswith("-36") and b.endswith("-2c")
-    # ELLIPSIS is 3 ASCII chars (not a single "…"), so at max_chars=8 there's
-    # only 2 head chars left once the 3-char discriminator tail is kept.
-    assert a.startswith("cl") and mod.ELLIPSIS in a
+def test_elide_keeps_the_start_and_appends_ellipsis():
+    out = elide_label("a-very-long-session-name-42", 8)
+    assert len(out) == 8
+    assert out == "a-ver" + mod.ELLIPSIS
+    assert out.startswith("a-ver")
+    assert mod.ELLIPSIS in out
 
 
 def test_elide_floor_is_eight_chars():
@@ -324,7 +323,8 @@ def test_elide_floor_is_eight_chars():
     for cap in (10, 14, 20):
         out = elide_label(label, cap)
         assert len(out) == cap
-        assert out.endswith(label[-((cap - 1) // 2):])
+        assert out.startswith(label[:cap - len(mod.ELLIPSIS)])
+        assert out.endswith(mod.ELLIPSIS)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +478,48 @@ def test_custom_title_label_beats_first_prompt_and_roster(tmp_path):
     assert sess(t).label() == "Session 1"
 
 
+def test_read_ai_title_picks_the_latest_and_refines_over_time(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    lines = [
+        {"type": "ai-title", "aiTitle": "Test for second session"},
+        {"type": "user", "message": {"content": "hi"}},
+        {"type": "ai-title", "aiTitle": "ui.cpp test for second session"},
+    ]
+    transcript.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+    assert read_ai_title_from_transcript(str(transcript)) == "ui.cpp test for second session"
+
+
+def test_ai_title_beats_first_prompt_but_loses_to_custom_title(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "ai-title", "aiTitle": "Fix the login bug"}) + "\n"
+    )
+    t = make_table()
+    t.handle_event(ev("SessionStart", transcript_path=str(transcript)))
+    t.handle_event(ev("UserPromptSubmit", prompt="hey can you look into something"))
+    assert sess(t).label() == "Fix the login bug"
+
+    # An explicit rename still wins over the generated one.
+    transcript.write_text(
+        transcript.read_text() +
+        json.dumps({"type": "custom-title", "customTitle": "My chat"}) + "\n"
+    )
+    t.handle_event(ev("Stop"))
+    assert sess(t).label() == "My chat"
+
+
+def test_ai_title_prevents_placeholder_filtering(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "ai-title", "aiTitle": "Investigate suspend recovery issue"}) + "\n"
+    )
+    t = make_table()
+    t.handle_event(ev("SessionStart", transcript_path=str(transcript)))
+    t.handle_event(ev("Stop"))   # back to idle, but ai_title makes it a real label
+    assert sess(t).is_placeholder() is False
+    assert sess(t).label() == "Investigate suspend recovery issue"
+
+
 # ---------------------------------------------------------------------------
 # tok — absolute context tokens in 1k units, consistent with ctx
 # ---------------------------------------------------------------------------
@@ -523,6 +565,43 @@ def test_tok_on_the_wire_at_index_11(tmp_path):
     row = json.loads(t.project(4096))["ss"][0]
     assert row[3] == 95                 # ctx
     assert row[11] == 190               # tok appended at the end
+
+
+# ---------------------------------------------------------------------------
+# Placeholder filtering — a window opened but never used shouldn't clutter
+# the device with a bare "<dir>-xx" name
+# ---------------------------------------------------------------------------
+
+def test_blank_session_is_a_placeholder_and_filtered_from_rows(tmp_path):
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), name="esp32-9e", cwd="/home/x/clawdmeter")
+    t.sweep()   # discovers it purely from the roster, same as an untouched window
+    assert sess(t).is_placeholder() is True
+    assert t.rows() == []
+
+
+def test_session_with_first_prompt_is_not_a_placeholder():
+    t = make_table()
+    t.handle_event(ev("UserPromptSubmit", prompt="add dark mode"))
+    assert sess(t).is_placeholder() is False
+    assert len(t.rows()) == 1
+
+
+def test_session_with_context_is_not_a_placeholder(tmp_path):
+    t = _table_with_transcript(tmp_path, 1000)   # gives it ctx != -1
+    assert sess(t).is_placeholder() is False
+    assert len(t.rows()) == 1
+
+
+def test_non_derived_roster_name_is_not_a_placeholder(tmp_path):
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), name="Fix the login bug",
+                  name_source="summarized", cwd="/home/x/clawdmeter")
+    t.sweep()
+    assert sess(t).is_placeholder() is False
+    assert len(t.rows()) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +677,7 @@ def test_effort_read_from_transcript_and_on_the_wire(tmp_path):
 # Roster liveness — §4.2: grace, unreadable roster, name pickup
 # ---------------------------------------------------------------------------
 
-def _write_roster(cdir, session_id, pid, name=None, cwd=None):
+def _write_roster(cdir, session_id, pid, name=None, cwd=None, name_source=None):
     sdir = cdir / "sessions"
     sdir.mkdir(parents=True, exist_ok=True)
     rec = {"pid": pid, "sessionId": session_id}
@@ -606,6 +685,8 @@ def _write_roster(cdir, session_id, pid, name=None, cwd=None):
         rec["name"] = name
     if cwd:
         rec["cwd"] = cwd
+    if name_source:
+        rec["nameSource"] = name_source
     (sdir / f"{pid}.json").write_text(json.dumps(rec))
 
 
@@ -684,6 +765,32 @@ def test_first_prompt_label_takes_priority_over_roster_and_cwd(tmp_path):
     _write_roster(tmp_path, SID, os.getpid(), name="clawdmeter-c5")
     t.handle_event(ev("UserPromptSubmit", cwd="/home/x/clawdmeter",
                       prompt="add dark mode to the settings page"))
+    assert sess(t).label() == "add dark mode to the settings page"
+
+
+def test_non_derived_roster_name_beats_first_prompt(tmp_path):
+    # A "derived" name is just the generic "<dir>-xx" placeholder and stays
+    # below first_prompt. Anything else means the host generated a real
+    # title (short, descriptive) that's a better label than the raw first
+    # message someone actually typed.
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), name="Fix the login bug",
+                  name_source="summarized")
+    t.handle_event(ev("UserPromptSubmit", cwd="/home/x/clawdmeter",
+                      prompt="hey can you help me look into something weird"))
+    t.sweep()
+    assert sess(t).label() == "Fix the login bug"
+
+
+def test_derived_roster_name_still_loses_to_first_prompt(tmp_path):
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), name="clawdmeter-c5",
+                  name_source="derived")
+    t.handle_event(ev("UserPromptSubmit", cwd="/home/x/clawdmeter",
+                      prompt="add dark mode to the settings page"))
+    t.sweep()
     assert sess(t).label() == "add dark mode to the settings page"
 
 
