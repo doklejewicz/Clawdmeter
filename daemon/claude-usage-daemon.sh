@@ -5,6 +5,7 @@
 # Dependencies: curl, awk, bluetoothctl
 
 DEVICE_NAME="Clawdmeter"
+MAC_RE='([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}'
 DEVICE_MAC="${DEVICE_MAC:-}"  # auto-discovered if empty
 SERVICE_UUID="4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
@@ -114,10 +115,53 @@ detect_hour_format() {
     esac
 }
 
+# The powered controller's own MAC (not the peripheral's), for `bluetoothctl
+# select` — see mac_to_dbus_path's comment. `select` only pins a controller
+# for the CURRENT bluetoothctl session, so every session below re-issues it
+# rather than relying on whatever BlueZ considers "default" right now.
+powered_controller_mac() {
+    local ctrl
+    while read -r ctrl; do
+        [ -z "$ctrl" ] && continue
+        if bluetoothctl show "$ctrl" 2>/dev/null | grep -q "Powered: yes"; then
+            echo "$ctrl"
+            return 0
+        fi
+    done < <(bluetoothctl list 2>/dev/null | awk '{print $2}')
+    return 1
+}
+
+# Pull a device's MAC out of raw bluetoothctl output robustly. bluetoothctl's
+# own prompt becomes "[<DeviceName>]> " once it focuses a device — since our
+# device's name is literally "Clawdmeter", every subsequent output line then
+# contains "Clawdmeter" too, and a naive `grep "$DEVICE_NAME" | awk '{print
+# $2}'` matches the wrong line (prompt noise, not the actual device listing)
+# and returns garbage instead of a MAC. Strip ANSI/CR noise first, then
+# require the literal "Device <mac> ... <name>" shape before extracting the
+# MAC by pattern, not by field position.
+extract_device_mac() {
+    sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' | tr -d '\r' \
+        | grep -E "Device ${MAC_RE} .*${DEVICE_NAME}" \
+        | grep -oE "$MAC_RE" | head -1
+}
+
 # Convert MAC to D-Bus path: AA:BB:CC:DD:EE:FF -> dev_AA_BB_CC_DD_EE_FF
 mac_to_dbus_path() {
-    local adapter
-    adapter=$(busctl call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null | grep -o '/org/bluez/hci[0-9]' | head -1)
+    # On a host with more than one Bluetooth controller, GetManagedObjects's
+    # ordering is not guaranteed to put the one actually in use first — a
+    # naive `head -1` can silently pick a different, powered-off controller,
+    # in which case every path built from it points at a device object that
+    # was never bonded/connected. Prefer whichever controller is actually
+    # powered; only fall back to "first listed" if none report powered
+    # (matches this script's behavior before this check existed).
+    local adapter powered_adapter
+    for adapter in $(busctl call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null | grep -o '/org/bluez/hci[0-9]*' | sort -u); do
+        if busctl get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null | grep -q "true"; then
+            powered_adapter="$adapter"
+            break
+        fi
+    done
+    adapter="${powered_adapter:-$(busctl call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null | grep -o '/org/bluez/hci[0-9]*' | head -1)}"
     adapter=${adapter:-/org/bluez/hci0}
     echo "${adapter}/dev_$(echo "$1" | tr ':' '_')"
 }
@@ -157,9 +201,14 @@ save_mac() {
 # scan by name. Sets DEVICE_MAC + caches it on success; returns non-zero if none.
 find_system_device_mac() {
     local found=""
-    local mode
+    local mode ctrl
+    ctrl=$(powered_controller_mac)
     for mode in Paired Connected; do
-        found=$(bluetoothctl devices "$mode" 2>/dev/null | grep "$DEVICE_NAME" | head -1 | awk '{print $2}')
+        if [ -n "$ctrl" ]; then
+            found=$( { echo "select $ctrl"; echo "devices $mode"; } | bluetoothctl 2>/dev/null | extract_device_mac)
+        else
+            found=$(bluetoothctl devices "$mode" 2>/dev/null | extract_device_mac)
+        fi
         [ -n "$found" ] && break
     done
     if [ -n "$found" ]; then
@@ -175,11 +224,18 @@ find_system_device_mac() {
 connect_device() {
     log "Connecting to $DEVICE_MAC..."
 
-    # Trust first (allows auto-reconnect)
-    bluetoothctl trust "$DEVICE_MAC" &>/dev/null
-
-    # Connect
-    bluetoothctl connect "$DEVICE_MAC" &>/dev/null
+    local ctrl
+    ctrl=$(powered_controller_mac)
+    if [ -n "$ctrl" ]; then
+        # Trust + connect in one session so `select` (session-local, see
+        # powered_controller_mac's comment) applies to both.
+        { echo "select $ctrl"; echo "trust $DEVICE_MAC"; echo "connect $DEVICE_MAC"; sleep 3; echo "quit"; } | bluetoothctl &>/dev/null
+    else
+        # No controller reported itself powered (shouldn't normally happen) —
+        # fall back to whatever bluetoothctl considers default.
+        bluetoothctl trust "$DEVICE_MAC" &>/dev/null
+        bluetoothctl connect "$DEVICE_MAC" &>/dev/null
+    fi
     sleep 2
 
     if is_connected; then
