@@ -51,3 +51,9 @@
 #define BOARD_HAS_BATTERY          0
 #define BOARD_HAS_IO_EXPANDER      0
 #define BOARD_HAS_SOUND            0
+// Session views (issue #135) use a compact layout tier on this screen — see
+// ui.cpp's SESSION_COMPACT block. This flag alone (via caps.cpp) only sets
+// runtime BoardCaps; the platformio.ini env also needs matching
+// -DBOARD_HAS_SESSION_VIEWS=1 -DSESSION_COMPACT=1 build flags, since ui.cpp
+// (shared code) can't see this header.
+#define BOARD_HAS_SESSION_VIEWS    1
