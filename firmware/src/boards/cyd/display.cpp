@@ -6,7 +6,9 @@
 // ILI9341 over plain 4-wire SPI. Arduino_ILI9341 always drives MADCTL with
 // the BGR bit set (matches this panel's wiring — same as the hardware-
 // verified TFT_eSPI build, which needed no RGB-order override for this
-// variant). No color inversion needed either (ips=false).
+// variant). ips=true — hardware-verified: without it the panel renders
+// fully bit-inverted (black background shows white, and hues flip to their
+// complement — e.g. orange renders as blue).
 //
 // Constructor width/height are the *native* (rotation-0/2) panel dimensions;
 // Arduino_GFX swaps them internally for odd rotation indices, so passing
@@ -19,7 +21,7 @@ static Arduino_ILI9341* gfx = nullptr;
 void display_hal_init(void) {
     bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCLK, LCD_MOSI,
                                GFX_NOT_DEFINED /* MISO unused for write-only flush */);
-    gfx = new Arduino_ILI9341(bus, LCD_RESET, LCD_ROTATION, false /* ips */,
+    gfx = new Arduino_ILI9341(bus, LCD_RESET, LCD_ROTATION, true /* ips */,
                               240 /* native width */, 320 /* native height */);
 }
 
