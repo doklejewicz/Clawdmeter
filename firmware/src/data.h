@@ -51,6 +51,15 @@ enum session_model_t : uint8_t {
     SESSION_MODEL_FABLE   = 4,
 };
 
+enum session_effort_t : uint8_t {
+    SESSION_EFFORT_UNKNOWN = 0,
+    SESSION_EFFORT_LOW     = 1,
+    SESSION_EFFORT_MEDIUM  = 2,
+    SESSION_EFFORT_HIGH    = 3,
+    SESSION_EFFORT_XHIGH   = 4,
+    SESSION_EFFORT_MAX     = 5,
+};
+
 enum session_tool_t : uint8_t {
     SESSION_TOOL_NONE      = 0,   // other / none
     SESSION_TOOL_BASH      = 1,
@@ -86,6 +95,8 @@ struct SessionRow {
     int32_t tok;                     // context tokens used, in units of 1k
                                      // (190 = 190k, 1200 = 1.2M); -1 = unknown.
                                      // Wire index 11; absent (older host) → -1.
+    uint8_t effort;                  // session_effort_t. Wire index 12;
+                                     // absent (older host) → 0 (unknown, hidden).
 };
 
 struct SessionList {
