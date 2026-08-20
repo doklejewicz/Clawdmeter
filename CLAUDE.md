@@ -14,6 +14,7 @@ Six ports today (two SoC families, four panel sizes):
 - `boards/waveshare_amoled_18_c6/` — Waveshare ESP32-C6-Touch-AMOLED-1.8 (368×448 portrait, SH8601, FT3168 touch, TCA9554 expander). Build env: `waveshare_amoled_18_c6`. Same panel as the S3 1.8 but on the C6 SoC. All subsystems (display, touch, BOOT + PWR buttons, battery, BLE) verified on hardware.
 - `boards/waveshare_amoled_206/` — Waveshare ESP32-S3-Touch-AMOLED-2.06 (CO5300, 410×502 watch form factor, FT3168 touch, no IO expander, 32 MB flash, PCF85063 RTC, ES8311 codec). Build env: `waveshare_amoled_206`. Display, touch, battery, IMU init, and BLE verified on hardware; the ES8311 chime path is not wired up (`sound.cpp` no-ops).
 - `boards/waveshare_lcd_154/` — Waveshare ESP32-S3-Touch-LCD-1.54 (ST7789, 240×240 square, CST816T touch @ 0x15). Build env: `waveshare_lcd_154`. **The first non-AMOLED port**: a plain 4-wire SPI TFT, not QSPI, and the panel has no brightness command — backlight is LEDC PWM on `LCD_BL`. **No PMU**: battery is an ADC divider on GPIO1 and `BAT_EN` (GPIO2) is a power-hold line that must be driven HIGH early in `board_init()` or the board browns out on battery. Three buttons (BOOT + GPIO5 + a PWR-role GPIO4); ES8311 chime wired up; QMI8658 populated but unused (fixed orientation, no rotation).
+- `boards/cyd/` — "Cheap Yellow Display" (ESP32-2432S028, 2.8" ILI9341 SPI TFT, XPT2046 resistive touch on its own SPI bus). Build env: `cyd`. **The first classic-ESP32 (Xtensa LX6) port** — every other board is S3 or C6. **Verified on real hardware (2026-08-20)**: flashes clean over the CH340 USB-serial bridge, boots, responds to serial debug commands, and NimBLE-Arduino advertises correctly as "Clawdmeter" with both GATT services (HID + the custom data service) — first time this codebase has exercised NimBLE on classic ESP32. `LCD_ROTATION 1` (board.h) is confirmed correct — display orientation looks right, no sideways/mirrored image. Colors need `ips=true` on the `Arduino_ILI9341` driver — with `ips=false` the panel rendered fully bit-inverted (black background showed white, orange mascot showed blue); fixed and confirmed. Touch registers taps cleanly (toggles splash/usage on tap, no phantom triggering). No PSRAM (`LV_USE_SNAPSHOT=0`, screenshot unsupported — confirmed: `screenshot` command correctly replies `SCREENSHOT_UNSUPPORTED`), no PMU/battery/IMU/secondary button/sound (the board has an unpopulated I2S-amp header, not wired up). Not to be confused with the unmerged upstream PR #123's `esp32_2432s024c`, a different (capacitive-touch, ST7789) board. The two-USB-port "cyd2usb" ST7789 variant is deliberately not covered yet — `Arduino_ST7789`'s MADCTL is hardcoded RGB order in this GFX library version, so matching its BGR wiring needs a software channel swap in `display_hal_draw_bitmap`, unverified without that hardware.
 
 Plus one non-hardware target: `boards/sim/` — **native desktop simulator** (SDL2 window, 480×480, `platform = native`). Build env: `sim`. See "Desktop simulator" below.
 
@@ -64,6 +65,17 @@ ESP32-C6 sibling of the S3 1.8: same 368×448 SH8601 panel + FocalTech touch, di
 - Buttons: GPIO 0 (BOOT → Space/voice-mode), AXP PKEY (PWR → cycle screens; hold-to-pair). **No third button**.
 - Flash: 32 MB. Uses `default_32MB.csv` partition table.
 
+### CYD (Cheap Yellow Display) — `cyd`
+Classic dual-core ESP32 (Xtensa LX6), not S3/C6. Pins taken from the
+hardware-verified TFT_eSPI/XPT2046_Touchscreen build in the sibling
+`ESP32-Cheap-Yellow-Display` repo's own examples.
+- Display: **ILI9341** via plain 4-wire SPI, HSPI bus (CS=15, SCLK=14, MOSI=13, MISO=12, DC=2, RST unwired, backlight=21 via LEDC PWM). `Arduino_ILI9341` always drives MADCTL with the BGR bit — matches this panel's wiring, no override needed.
+- Touch: **XPT2046** resistive, own SPI bus (VSPI, non-default pins: CLK=25, MOSI=32, MISO=39, CS=33, IRQ=36). Self-widening ADC calibration bounds, same scheme as the verified build.
+- No PMU, no battery, no IMU, no IO expander, no populated speaker (I2S-amp header exists per `PINS.md` but isn't wired up).
+- Buttons: GPIO 0 (BOOT → Space/voice-mode). **No second or PWR-role button.**
+- Flash: 4 MB. Uses `huge_app.csv` (no OTA slot — same partition choice PR #123 made for the sibling `esp32_2432s024c` board on the same flash size).
+- **Verified on real hardware (2026-08-20)**: flashes over CH340, boots, responds to serial debug commands, and BLE advertises correctly ("Clawdmeter", HID + custom data service) — first classic-ESP32 NimBLE-Arduino build in this repo, confirmed working. `LCD_ROTATION 1` gives correct display orientation (no sideways/mirrored image). Needed `ips=true` on the `Arduino_ILI9341` constructor to fix full color inversion (black↔white, hues flipped to their complement). Touch registers taps cleanly (toggles splash/usage via `global_click_cb` on tap, no phantom triggering) — XPT2046 wiring/calibration confirmed good.
+
 ## Architecture
 
 ```text
@@ -82,6 +94,7 @@ firmware/src/
     waveshare_amoled_18_c6/ — C6: SH8601 + FT3168 + AXP PKEY + TCA9554 (gates power), no PSRAM
     waveshare_amoled_206/   — CO5300 + FT3168 + AXP PKEY, no IO expander, 32 MB, no rotation
     waveshare_lcd_154/      — ST7789 SPI TFT + CST816T + ADC battery (no PMU), PWM backlight
+    cyd/                    — classic ESP32 + ILI9341 SPI TFT + XPT2046 resistive touch (unverified on hardware)
     sim/                    — native desktop simulator: SDL2 + Arduino shims + scenario playback
     template/               — copy this to bootstrap a new port
   main.cpp                  — setup() + loop(): HAL calls only, zero #ifdef BOARD_*
@@ -111,6 +124,7 @@ pio run -d firmware -e waveshare_amoled_216_c6                                  
 pio run -d firmware -e waveshare_amoled_18_c6                                   # build 1.8 (C6)
 pio run -d firmware -e waveshare_amoled_206                                     # build 2.06 (S3, watch)
 pio run -d firmware -e waveshare_lcd_154                                        # build 1.54 (S3, SPI TFT)
+pio run -d firmware -e cyd                                                      # build CYD (classic ESP32, unverified on hardware)
 pio run -d firmware -e waveshare_amoled_18 -t upload --upload-port /dev/cu.usbmodem101   # flash 1.8 on macOS
 pio run -d firmware -e waveshare_amoled_216 -t upload --upload-port /dev/ttyACM0         # flash 2.16 on Linux
 # C6 boards: same native USB-JTAG flashing; flag a chip mismatch ("This chip is ESP32-C6,
