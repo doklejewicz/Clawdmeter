@@ -208,6 +208,20 @@ def tool_code(tool_name):
     return TOOL_CODES.get(tool_name or "", 0)
 
 
+PROMPT_LABEL_MAX = 80  # raw capture cap; elide_label narrows further to the wire budget
+
+
+def clean_prompt_label(text):
+    """First-user-prompt label: collapse whitespace to single spaces and cap
+    length. Returns None for anything not worth using (empty/non-string)."""
+    if not isinstance(text, str):
+        return None
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return None
+    return cleaned[:PROMPT_LABEL_MAX]
+
+
 def elide_label(label, max_chars):
     """Middle-elide to max_chars characters, preserving the trailing
     discriminator — `clawdmeter-36` and `clawdmeter-2c` must stay distinct."""
@@ -419,6 +433,7 @@ class Session:
         "session_id", "sid", "state", "state_since", "last_event_at",
         "roster_name", "cwd", "transcript_path", "current_tool", "open_tools",
         "nagents", "tdone", "ttotal", "ctx", "tok", "model", "missing_since",
+        "first_prompt",
     )
 
     def __init__(self, session_id, now):
@@ -439,8 +454,15 @@ class Session:
         self.tok = -1  # context tokens in 1k units; -1 whenever ctx is -1
         self.model = 0
         self.missing_since = None  # first time the roster didn't vouch for us
+        # First user prompt, cleaned + capped (see _clean_prompt_label) - a
+        # more useful label than the host's auto-derived "<dir>-xx" name, at
+        # the cost of prompt text becoming device-visible (opt-in tradeoff,
+        # see SESSIONS.md's privacy note).
+        self.first_prompt = None
 
     def label(self):
+        if self.first_prompt:
+            return self.first_prompt
         if self.roster_name:
             return self.roster_name
         if self.cwd:
@@ -509,6 +531,10 @@ class SessionTable:
             sess.current_tool = None
             sess.open_tools.clear()
             self._set_state(sess, STATE_THINKING, now)
+            if sess.first_prompt is None:
+                cleaned = clean_prompt_label(payload.get("prompt"))
+                if cleaned:
+                    sess.first_prompt = cleaned
 
         elif event == "PreToolUse":
             tool = payload.get("tool_name")
@@ -552,7 +578,13 @@ class SessionTable:
                 )
 
         elif event == "PermissionRequest":
-            self._set_state(sess, STATE_WAITING_PERMISSION, now)
+            # AskUserQuestion also fires a PermissionRequest for its own
+            # approval prompt - keep the more specific WAITING_QUESTION
+            # rather than downgrading to the generic WAITING_PERMISSION.
+            if sess.current_tool == "AskUserQuestion":
+                self._set_state(sess, STATE_WAITING_QUESTION, now)
+            else:
+                self._set_state(sess, STATE_WAITING_PERMISSION, now)
 
         elif event == "PermissionDenied":
             self._set_state(sess, STATE_THINKING, now)
@@ -560,7 +592,10 @@ class SessionTable:
         elif event == "Notification":
             ntype = payload.get("notification_type")
             if ntype == "permission_prompt":
-                self._set_state(sess, STATE_WAITING_PERMISSION, now)
+                if sess.current_tool == "AskUserQuestion":
+                    self._set_state(sess, STATE_WAITING_QUESTION, now)
+                else:
+                    self._set_state(sess, STATE_WAITING_PERMISSION, now)
             elif ntype in ("agent_needs_input", "elicitation_dialog"):
                 self._set_state(sess, STATE_WAITING_INPUT, now)
             elif ntype in ("idle_prompt", "agent_completed"):

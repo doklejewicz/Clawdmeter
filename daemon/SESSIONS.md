@@ -133,8 +133,14 @@ rosters and transcripts across several Claude config dirs.
 ## Notes
 
 - **Privacy/security.** Hook payloads contain prompt and response text, so the
-  listener binds `127.0.0.1` only and rejects non-loopback peers. Nothing from
-  the payload text ever reaches the device — only names, states, and counts.
+  listener binds `127.0.0.1` only and rejects non-loopback peers. The one
+  exception to "no payload text reaches the device": each session's label
+  prefers its first user prompt (cleaned + capped at 80 chars, see
+  `clean_prompt_label()`) over the host's generic "`<dir>-xx`" name, so
+  whatever you type first is what shows up on the device's screen — visible
+  to anyone near it. Falls back to the directory-derived name if the prompt
+  is empty/unavailable. Everything else (state, counts, model, tool) stays
+  metadata-only.
 - **Liveness.** Sessions are considered alive while their roster entry
   (`<config-dir>/sessions/<pid>.json`) points at a running process — not on an
   activity timeout, so a chat parked on a permission prompt survives

@@ -15,8 +15,9 @@ from daemon.clawdmeter_sessions import (
     STATE_STARTING, STATE_IDLE, STATE_THINKING, STATE_RESPONDING,
     STATE_RUNNING_TOOL, STATE_COMPACTING, STATE_WAITING_PERMISSION,
     STATE_WAITING_QUESTION, STATE_WAITING_INPUT, STATE_ERROR,
-    SessionTable, compute_window, context_percent, elide_label,
-    encode_payload, fit_payload, model_code, state_bucket, tokens_k, tool_code,
+    SessionTable, clean_prompt_label, compute_window, context_percent,
+    elide_label, encode_payload, fit_payload, model_code, state_bucket,
+    tokens_k, tool_code,
 )
 
 SID = "a3f10c2e-0000-4000-8000-000000000001"
@@ -79,6 +80,16 @@ def test_pre_tool_use_is_running_tool():
 def test_ask_user_question_is_waiting_question():
     t = make_table()
     t.handle_event(ev("PreToolUse", tool_name="AskUserQuestion", tool_use_id="q1"))
+    assert sess(t).state == STATE_WAITING_QUESTION
+
+
+def test_ask_user_question_permission_request_does_not_clobber_waiting_question():
+    """Some harnesses fire a PermissionRequest for AskUserQuestion's own
+    approval prompt - that must not downgrade the more specific
+    WAITING_QUESTION back to the generic WAITING_PERMISSION."""
+    t = make_table()
+    t.handle_event(ev("PreToolUse", tool_name="AskUserQuestion", tool_use_id="q1"))
+    t.handle_event(ev("PermissionRequest", tool_name="AskUserQuestion", tool_use_id="q1"))
     assert sess(t).state == STATE_WAITING_QUESTION
 
 
@@ -581,6 +592,40 @@ def test_stale_sweep_backstop(tmp_path):
     clock.tick(mod.STALE_SWEEP_S + 1)
     assert t.sweep() is True
     assert t.sessions == {}
+
+
+def test_clean_prompt_label_collapses_whitespace_and_caps_length():
+    assert clean_prompt_label("  fix   the\nbug\tplease  ") == "fix the bug please"
+    assert clean_prompt_label("x" * 200) == "x" * 80
+    assert clean_prompt_label("") is None
+    assert clean_prompt_label("   ") is None
+    assert clean_prompt_label(None) is None
+    assert clean_prompt_label(42) is None
+
+
+def test_first_prompt_label_takes_priority_over_roster_and_cwd(tmp_path):
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), name="clawdmeter-c5")
+    t.handle_event(ev("UserPromptSubmit", cwd="/home/x/clawdmeter",
+                      prompt="add dark mode to the settings page"))
+    assert sess(t).label() == "add dark mode to the settings page"
+
+
+def test_first_prompt_label_sticks_to_the_first_turn():
+    t = make_table()
+    t.handle_event(ev("UserPromptSubmit", prompt="first question"))
+    t.handle_event(ev("UserPromptSubmit", prompt="second question"))
+    assert sess(t).label() == "first question"
+
+
+def test_empty_prompt_falls_back_to_roster_name(tmp_path):
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), name="clawdmeter-c5")
+    t.handle_event(ev("UserPromptSubmit", cwd="/home/x/clawdmeter", prompt="   "))
+    t.sweep()
+    assert sess(t).label() == "clawdmeter-c5"
 
 
 def test_roster_supplies_label_and_liveness(tmp_path):
