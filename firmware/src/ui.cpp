@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "splash.h"
+#include <Arduino.h>
 #include <lvgl.h>
 #include <time.h>
 #include "logo.h"
@@ -263,18 +264,18 @@ static const char* const anim_messages[] = {
     "Accomplishing", "Elucidating", "Perusing",
     "Actioning", "Enchanting", "Philosophising",
     "Actualizing", "Envisioning", "Pondering",
-    "Baking", "Finagling", "Pontificating",
+    "Baking", "Finagling", "Pontificating", "Let me out", 
     "Booping", "Flibbertigibbeting", "Processing",
     "Brewing", "Forging", "Puttering",
     "Calculating", "Forming", "Puzzling",
     "Cerebrating", "Frolicking", "Reticulating",
     "Channelling", "Generating", "Ruminating",
-    "Churning", "Germinating", "Scheming",
+    "Churning", "Germinating", "Scheming", "Make it stop", 
     "Clauding", "Hatching", "Schlepping",
     "Coalescing", "Herding", "Shimmying",
     "Cogitating", "Honking", "Shucking",
     "Combobulating", "Hustling", "Simmering",
-    "Computing", "Ideating", "Smooshing",
+    "Computing", "Ideating", "Smooshing", "Please help me", 
     "Concocting", "Imagining", "Spelunking",
     "Conjuring", "Incubating", "Spinning",
     "Considering", "Inferring", "Stewing",
@@ -283,14 +284,14 @@ static const char* const anim_messages[] = {
     "Crafting", "Marinating", "Thinking",
     "Creating", "Meandering", "Tinkering",
     "Crunching", "Moseying", "Transmuting",
-    "Deciphering", "Mulling", "Unfurling",
+    "Deciphering", "Mulling", "Unfurling", "Feeling pain", 
     "Deliberating", "Mustering", "Unravelling",
     "Determining", "Musing", "Vibing",
     "Discombobulating", "Noodling", "Wandering",
     "Divining", "Percolating", "Whirring",
     "Doing", "Wibbling",
     "Effecting", "Wizarding",
-    "Working", "Wrangling",
+    "Working", "Wrangling", "ඞ"
 };
 #define ANIM_MSG_COUNT (sizeof(anim_messages) / sizeof(anim_messages[0]))
 
@@ -487,13 +488,63 @@ static void apply_anim_visibility(void);   // status-line rule (§2.3)
 #define CHAT_LINGER_MS (10u * 60u * 1000u)
 #endif
 
-// Geometry — the capability gate limits these views to 480×480-class panels
-// (the S3 2.16 and the sim); other geometries need a layout pass before their
-// flag can flip, so these are tuned constants, not breakpoints.
+// Geometry — the capability gate originally limited these views to
+// 480×480-class panels (the S3 2.16 and the sim); other geometries need a
+// layout pass before their flag can flip, so these were tuned constants, not
+// breakpoints. The CYD's 320x240 landscape panel is the first much-smaller
+// screen to get one. ui.cpp never includes board.h (shared code can't see
+// LCD_HEIGHT), so — same exception BOARD_HAS_SESSION_VIEWS itself already
+// makes — SESSION_COMPACT must come in as its own global build flag
+// (-DSESSION_COMPACT=1 in the board's platformio.ini env), not a header
+// constant. Unverified without a screenshot-capable board; expect a
+// flash-and-look iteration pass on real hardware.
+#ifndef SESSION_COMPACT
+#define SESSION_COMPACT 0
+#endif
+
+#if SESSION_COMPACT
 // Quota strip + vertical rhythm ported from PR #129's combined 5h/7d row
 // (the visual language issue #135 credits): a 30px band at content_y with
 // dim styrene_20 tags, styrene_24 percentages in a fixed right-aligned
-// column, 10px bars, and a 14px(+4) gap down to the first card.
+// column, 10px bars, and a 14px(+4) gap down to the first card. Scaled ~0.6x
+// here to fit a 240px-tall screen instead of 480px.
+#define CHAT_ROW_H        22    // strip band height; text/bar vcentered in it
+#define CHAT_ROW_BAR_H    6
+#define CHAT_ROW_LBL_W    24    // "5h"/"7d" column
+#define CHAT_ROW_PCT_W    40    // percentage column (right-aligned, fixed)
+#define CHAT_ROW_COL_GAP  6     // label|bar|pct column gap
+#define CHAT_ROW_HALF_GAP 10    // between the 5h and 7d halves
+#define CHAT_ROW_GAP      8     // strip band ↓ card list (plus 4, per #129)
+#define CHAT_CARD_H       64
+#define CHAT_CARD_GAP     6     // between cards (#129 ch_card_gap)
+#define CHAT_CARD_PITCH   (CHAT_CARD_H + CHAT_CARD_GAP)
+#define CHAT_CARD_PAD_Y   4
+// Chat cards (and the ONE-CHAT quota box) bleed to the physical left/right
+// edges — the card's own corner radius is the relief at the glass edge. The
+// inner side padding keeps text at the same inset the screen margin
+// provided, clear of the panel's rounded corners.
+#define CHAT_CARD_PAD_X   10
+#define CHAT_FADE_H       24    // bottom fade band: transparent → panel black
+// ONE-CHAT: two boxes — the 5h quota panel (exact RESTING "Current" panel)
+// on top, the chat card below it.
+#define FOCUS_CARD_H      90
+#define FOCUS_PANEL_GAP   6     // 5h panel ↔ chat card
+#define SESSION_FONT_NAME_FOCUS font_styrene_20
+#define SESSION_FONT_NAME_LIST  font_styrene_14
+#define SESSION_FONT_LINE       font_styrene_12
+#define SESSION_FONT_STRIP_TAG  font_styrene_14
+#define SESSION_FONT_STRIP_PCT  font_styrene_16
+#define SESSION_FONT_MODEL      font_styrene_14
+#define SESSION_DOT_SZ          8
+#define SESSION_BAR_H_FOCUS     6
+#define SESSION_BAR_H_LIST      4
+#define SESSION_BAR_OFFSET_FOCUS (-20)
+#define SESSION_BAR_OFFSET_LIST  (-18)
+#define SESSION_ICON_TODO(focus)    (&icon_todo_small_dsc)
+#define SESSION_ICON_AGENTS(focus)  (&icon_agents_small_dsc)
+#define SESSION_STATE_LABEL_W       120
+#define SESSION_FOCUS_ROW2_Y        26
+#else
 #define CHAT_ROW_H        30    // strip band height; text/bar vcentered in it
 #define CHAT_ROW_BAR_H    10
 #define CHAT_ROW_LBL_W    40    // "5h"/"7d" column
@@ -515,6 +566,31 @@ static void apply_anim_visibility(void);   // status-line rule (§2.3)
 // on top, the chat card below it.
 #define FOCUS_CARD_H      176
 #define FOCUS_PANEL_GAP   16    // 5h panel ↔ chat card
+#define SESSION_FONT_NAME_FOCUS font_styrene_48
+#define SESSION_FONT_NAME_LIST  font_styrene_28
+#define SESSION_FONT_LINE       font_styrene_24
+#define SESSION_FONT_STRIP_TAG  font_styrene_24
+#define SESSION_FONT_STRIP_PCT  font_styrene_28
+#define SESSION_FONT_MODEL      font_styrene_24
+#define SESSION_DOT_SZ          14
+#define SESSION_BAR_H_FOCUS     12
+#define SESSION_BAR_H_LIST      8
+#define SESSION_BAR_OFFSET_FOCUS (-40)
+#define SESSION_BAR_OFFSET_LIST  (-38)
+#define SESSION_ICON_TODO(focus)    ((focus) ? &icon_todo_dsc : &icon_todo_small_dsc)
+#define SESSION_ICON_AGENTS(focus)  ((focus) ? &icon_agents_dsc : &icon_agents_small_dsc)
+#define SESSION_STATE_LABEL_W       200
+#define SESSION_FOCUS_ROW2_Y        64
+#endif  // SESSION_COMPACT
+
+// LVGL's built-in scroll pause (LV_LABEL_SCROLL_DELAY, lv_label.c) is a fixed
+// 300ms baked into the vendored library — not ours to edit (firmware/.pio is
+// regenerated, gitignored). The public override is a style-level anim
+// template: lv_label_refr_text() copies reverse_delay/repeat_delay/repeat_cnt
+// out of whatever lv_obj_set_style_anim() attached, when the label is in
+// LV_LABEL_LONG_SCROLL mode. Longer than the default so a name is readable
+// before it moves.
+#define SESSION_NAME_SCROLL_PAUSE_MS 2500
 
 // One chat card's widget set. Cards keep stable identity: each card widget is
 // bound to a chat (keyed by sid), not to a slot, so a reorder moves the widget
@@ -523,6 +599,8 @@ struct ChatCard {
     lv_obj_t* card;
     lv_obj_t* lbl_name;
     lv_obj_t* lbl_ctx;      // ctx% top-right (list cards only; focus has the big pct)
+    lv_obj_t* lbl_model;    // model tag, left of ctx% (list cards only; focus has the pill)
+    lv_obj_t* lbl_effort;   // effort tag, left of the model tag (list cards only)
     lv_obj_t* bar;          // context bar — hidden entirely when ctx is unknown
     lv_obj_t* dot;          // state indicator; pulses when waiting
     lv_obj_t* lbl_state;
@@ -531,13 +609,14 @@ struct ChatCard {
     lv_obj_t* img_agents;
     lv_obj_t* lbl_agents;
     lv_obj_t* lbl_elapsed;
-    const lv_font_t* name_font;  // for the firmware-side name ellipsis
+    const lv_font_t* name_font;  // for measuring the dynamic scroll width
     int  name_w;
     char sid[3];
     int  target_y;          // slide destination (list cards)
     bool used;
     bool waiting;
     bool claimed;           // per-update matching scratch
+    bool name_scrolling;    // current lbl_name long_mode: SCROLL vs parked DOT
 };
 
 static lv_obj_t* focus_group = nullptr;   // ONE-CHAT (§1.3)
@@ -545,7 +624,8 @@ static lv_obj_t* chats_group = nullptr;   // SEVERAL-CHATS (§1.4)
 static lv_obj_t* cards_cont  = nullptr;   // clipping viewport for the card list
 static ChatCard  chat_cards[SESSION_MAX_ROWS];
 static ChatCard  focus_card;
-static lv_obj_t* focus_lbl_model = nullptr;
+static lv_obj_t* focus_lbl_model  = nullptr;
+static lv_obj_t* focus_lbl_effort = nullptr;  // effort pill, left of the model pill
 static lv_obj_t* focus_lbl_ctx   = nullptr;   // context % (left, on its own row)
 static lv_obj_t* focus_lbl_tok   = nullptr;   // token counter (right of the % row)
 
@@ -627,42 +707,42 @@ static void session_tok_text(int32_t tok_k, char* buf, size_t n) {
                                (int)((tok_k % 1000) / 100));
 }
 
+static const char* const session_model_names[] = { "", "opus", "sonnet", "haiku", "fable" };
+static const char* session_model_text(uint8_t model) {
+    return model <= SESSION_MODEL_FABLE ? session_model_names[model] : "";
+}
+
+// Short forms for the reasoning-effort pill — "xhigh" reads as a typo at this
+// size, so it gets its own word instead of the raw wire name.
+static const char* const session_effort_names[] = {
+    "", "low", "mid", "high", "ultra", "max"
+};
+static const char* session_effort_text(uint8_t effort) {
+    return effort <= SESSION_EFFORT_MAX ? session_effort_names[effort] : "";
+}
+
+// Style-level override for the name label's scroll pause — see
+// SESSION_NAME_SCROLL_PAUSE_MS. lv_anim_init() zeroes fields we don't touch
+// (act_time, exec/completed cb, values/duration) — lv_label_refr_text()
+// fills those in itself and only borrows repeat_cnt/repeat_delay/
+// reverse_delay from this template.
+static lv_anim_t s_name_scroll_anim;
+static bool      s_name_scroll_anim_ready = false;
+static const lv_anim_t* name_scroll_anim_template(void) {
+    if (!s_name_scroll_anim_ready) {
+        lv_anim_init(&s_name_scroll_anim);
+        lv_anim_set_repeat_count(&s_name_scroll_anim, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_reverse_delay(&s_name_scroll_anim, SESSION_NAME_SCROLL_PAUSE_MS);
+        lv_anim_set_repeat_delay(&s_name_scroll_anim, SESSION_NAME_SCROLL_PAUSE_MS);
+        s_name_scroll_anim_ready = true;
+    }
+    return &s_name_scroll_anim;
+}
+
 // A routine content refresh must not animate anything (§2.3) — and rewriting
 // a label always invalidates it, so compare first.
 static void set_label_if_changed(lv_obj_t* lbl, const char* txt) {
     if (strcmp(lv_label_get_text(lbl), txt) != 0) lv_label_set_text(lbl, txt);
-}
-
-// Ellipsize in firmware: measure, then middle-elide with "..." (three dots),
-// keeping the label's trailing characters — that tail is the host's session
-// discriminator ("clawdmeter-36" vs "clawdmeter-2c" must stay distinct, §5).
-// LVGL's LONG_DOT places its dots via the label's line-box math, which parks
-// them on the (hidden) wrapped second line when the box is exactly one line
-// tall — so the truncation is done deterministically here instead.
-static void label_set_ellipsized(lv_obj_t* lbl, const char* txt,
-                                 const lv_font_t* font, int max_w) {
-    lv_point_t sz;
-    lv_text_get_size(&sz, txt, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    if (sz.x <= max_w) {
-        set_label_if_changed(lbl, txt);
-        return;
-    }
-    char buf[SESSION_LABEL_MAX + 4];
-    size_t len = strlen(txt);
-    if (len >= SESSION_LABEL_MAX) len = SESSION_LABEL_MAX - 1;
-    const size_t tail = len > 8 ? 4 : 0;   // keep the sid discriminator
-    size_t head = len - tail;
-    while (head > 0) {
-        memcpy(buf, txt, head);
-        buf[head] = '\0';
-        strcat(buf, "...");
-        memcpy(buf + head + 3, txt + len - tail, tail);
-        buf[head + 3 + tail] = '\0';
-        lv_text_get_size(&sz, buf, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-        if (sz.x <= max_w) break;
-        head--;
-    }
-    set_label_if_changed(lbl, buf);
 }
 
 // ---- The pulse (§2.3) ----
@@ -725,8 +805,8 @@ static lv_obj_t* make_card_label(lv_obj_t* parent, const lv_font_t* font, lv_col
 // context bar, state line — the focus variant is just bigger and swaps the
 // top-right ctx% for the model name + a big percentage.
 static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool focus) {
-    const lv_font_t* f_name = focus ? &font_styrene_48 : &font_styrene_28;
-    const lv_font_t* f_line = focus ? &font_styrene_24 : &font_styrene_24;
+    const lv_font_t* f_name = focus ? &SESSION_FONT_NAME_FOCUS : &SESSION_FONT_NAME_LIST;
+    const lv_font_t* f_line = &SESSION_FONT_LINE;
     const int h = focus ? FOCUS_CARD_H : CHAT_CARD_H;
 
     c->card = make_panel(parent, x, y, L.scr_w, h);   // full-bleed (see CHAT_CARD_PAD_X)
@@ -742,31 +822,62 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
     // Name width starts at the full row; every content update re-budgets it
     // against the measured width of the actual right-side neighbor (the model
     // pill on the focus card, the token label on list cards) so a long name
-    // ellipsizes right up to its neighbor instead of a worst-case gap.
+    // scrolls right up to its neighbor instead of stopping short at a
+    // worst-case gap.
     c->name_font = f_name;
     c->name_w = cw;
     c->lbl_name = make_card_label(c->card, f_name, COL_TEXT);
     lv_obj_set_width(c->lbl_name, cw);
-    // One line, exactly — the ellipsis itself is applied firmware-side (see
-    // label_set_ellipsized); the fixed box just guards against any wrap.
+    // Long names/prompts scroll through the available width instead of
+    // being cut short with an ellipsis — LVGL only animates when the text
+    // is actually wider than the box, so short names just sit still. One
+    // line, exactly, so it never wraps to a second line first. Ping-pong
+    // (pauses at each end, then reverses) rather than a one-way circular
+    // loop — trying this mode per user request, easy to flip back. The
+    // style-anim template lengthens the pause at each end past LVGL's
+    // built-in 300ms default (SESSION_NAME_SCROLL_PAUSE_MS).
+    lv_label_set_long_mode(c->lbl_name, LV_LABEL_LONG_SCROLL);
+    lv_obj_set_style_anim(c->lbl_name, name_scroll_anim_template(), 0);
     lv_obj_set_height(c->lbl_name, lv_font_get_line_height(f_name));
     lv_obj_align(c->lbl_name, LV_ALIGN_TOP_LEFT, 0, 0);
 
     if (!focus) {
         c->lbl_ctx = make_card_label(c->card, f_name, COL_TEXT);
         lv_obj_align(c->lbl_ctx, LV_ALIGN_TOP_RIGHT, 0, 0);
+        // Same pill treatment as the focus card's model chip, scaled down.
+        c->lbl_model = make_card_label(c->card, &SESSION_FONT_MODEL, COL_TEXT);
+        lv_obj_set_style_bg_color(c->lbl_model, COL_BAR_BG, 0);
+        lv_obj_set_style_bg_opa(c->lbl_model, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(c->lbl_model, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_left(c->lbl_model, 6, 0);
+        lv_obj_set_style_pad_right(c->lbl_model, 6, 0);
+        lv_obj_set_style_pad_top(c->lbl_model, 2, 0);
+        lv_obj_set_style_pad_bottom(c->lbl_model, 2, 0);
+        lv_obj_align(c->lbl_model, LV_ALIGN_TOP_RIGHT, 0, 0);
+        c->lbl_effort = make_card_label(c->card, &SESSION_FONT_MODEL, COL_TEXT);
+        lv_obj_set_style_bg_color(c->lbl_effort, COL_BAR_BG, 0);
+        lv_obj_set_style_bg_opa(c->lbl_effort, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(c->lbl_effort, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_left(c->lbl_effort, 6, 0);
+        lv_obj_set_style_pad_right(c->lbl_effort, 6, 0);
+        lv_obj_set_style_pad_top(c->lbl_effort, 2, 0);
+        lv_obj_set_style_pad_bottom(c->lbl_effort, 2, 0);
+        lv_obj_align(c->lbl_effort, LV_ALIGN_TOP_RIGHT, 0, 0);
     } else {
         c->lbl_ctx = nullptr;
+        c->lbl_model = nullptr;
+        c->lbl_effort = nullptr;
     }
 
-    c->bar = make_bar(c->card, 0, 0, cw, focus ? 12 : 8);
+    c->bar = make_bar(c->card, 0, 0, cw, focus ? SESSION_BAR_H_FOCUS : SESSION_BAR_H_LIST);
     lv_obj_set_style_bg_color(c->bar, COL_DIM, LV_PART_INDICATOR);  // context stays neutral (§1.3)
-    lv_obj_align(c->bar, LV_ALIGN_BOTTOM_LEFT, 0, focus ? -40 : -38);
+    lv_obj_align(c->bar, LV_ALIGN_BOTTOM_LEFT, 0,
+                focus ? SESSION_BAR_OFFSET_FOCUS : SESSION_BAR_OFFSET_LIST);
 
     // State line — everything shares one visual center line, `line_c` px above
     // the card content's bottom edge. The dot sits flush with the card's left
     // content edge (same x as the name and the bar above it).
-    const int dot_sz  = focus ? 14 : 14;
+    const int dot_sz  = SESSION_DOT_SZ;
     const int line_h  = lv_font_get_line_height(f_line);
     const int line_dy = focus ? -2 : 0;   // base line, from content bottom
     // Dot center = label line-box center (measured: Styrene's lowercase
@@ -786,7 +897,7 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
     lv_obj_align(c->dot, LV_ALIGN_BOTTOM_LEFT, 0, dot_dy);
     c->lbl_state = make_card_label(c->card, f_line, COL_DIM);
     lv_label_set_long_mode(c->lbl_state, LV_LABEL_LONG_DOT);  // state ellipsizes before a badge drops (§5)
-    lv_obj_set_width(c->lbl_state, focus ? 200 : 200);
+    lv_obj_set_width(c->lbl_state, SESSION_STATE_LABEL_W);
     // One text line, exactly: with a free-growing height an over-long state
     // would wrap to a second line instead of taking the DOT ellipsis.
     lv_obj_set_height(c->lbl_state, line_h);
@@ -797,10 +908,10 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
     // Badge colors: todo = terra-cotta accent, subagents = the palette's
     // muted purple; icon and count share the color so each badge reads as
     // one unit.
-    c->img_todo = make_badge_icon(c->card, focus ? &icon_todo_dsc : &icon_todo_small_dsc,
+    c->img_todo = make_badge_icon(c->card, SESSION_ICON_TODO(focus),
                                   COL_ACCENT);
     c->lbl_todo = make_card_label(c->card, f_line, COL_ACCENT);
-    c->img_agents = make_badge_icon(c->card, focus ? &icon_agents_dsc : &icon_agents_small_dsc,
+    c->img_agents = make_badge_icon(c->card, SESSION_ICON_AGENTS(focus),
                                     COL_PURPLE);
     c->lbl_agents = make_card_label(c->card, f_line, COL_PURPLE);
 
@@ -810,6 +921,7 @@ static void build_chat_card(ChatCard* c, lv_obj_t* parent, int x, int y, bool fo
     c->sid[0] = 0;
     c->target_y = -1;
     c->used = c->waiting = c->claimed = false;
+    c->name_scrolling = true;   // matches the LV_LABEL_LONG_SCROLL set above
 }
 
 // Right-align the badge cluster: timer rightmost, subagent badge to its left,
@@ -838,10 +950,11 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
     c->waiting = (bucket == SESSION_BUCKET_WAITING);
 
     char buf[24];
-    // Top-right label (list cards): token count when the host sends one,
-    // ctx% as the older-host fallback, hidden when both are unknown. Set
-    // BEFORE the name so the name's ellipsis budget can track the rendered
-    // width of its actual neighbor (a hidden label gives the name the row).
+    // Top-right cluster (list cards): effort tag, model tag, then token
+    // count (or ctx% as the older-host fallback) — right-aligned and chained
+    // like the bottom badge cluster. Set BEFORE the name so the name's
+    // scroll width can track the rendered width of its actual neighbors
+    // (hidden labels give the name back their share of the row).
     if (c->lbl_ctx) {
         const int cw = L.scr_w - 2 * CHAT_CARD_PAD_X;
         bool shown = true;
@@ -863,13 +976,57 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
         } else {
             lv_obj_add_flag(c->lbl_ctx, LV_OBJ_FLAG_HIDDEN);
         }
+
+        lv_obj_t* anchor = shown ? c->lbl_ctx : nullptr;
+
+        // Effort sits closest to ctx% (rightmost of the two tags), model
+        // chains off its left — reads left-to-right as "model, effort, ctx%".
+        const char* effort = session_effort_text(r->effort);
+        if (effort[0]) {
+            set_label_if_changed(c->lbl_effort, effort);
+            lv_obj_clear_flag(c->lbl_effort, LV_OBJ_FLAG_HIDDEN);
+            if (anchor) lv_obj_align_to(c->lbl_effort, anchor, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+            else        lv_obj_align(c->lbl_effort, LV_ALIGN_TOP_RIGHT, 0, 0);
+            lv_point_t esz;
+            lv_text_get_size(&esz, effort, &SESSION_FONT_MODEL, 0, 0,
+                             LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+            nw -= esz.x + 2 * 6 /*pill pad*/ + 6 /*gap*/;
+            anchor = c->lbl_effort;
+        } else {
+            lv_obj_add_flag(c->lbl_effort, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        const char* model = session_model_text(r->model);
+        if (model[0]) {
+            set_label_if_changed(c->lbl_model, model);
+            lv_obj_clear_flag(c->lbl_model, LV_OBJ_FLAG_HIDDEN);
+            if (anchor) lv_obj_align_to(c->lbl_model, anchor, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+            else        lv_obj_align(c->lbl_model, LV_ALIGN_TOP_RIGHT, 0, 0);
+            lv_point_t msz;
+            lv_text_get_size(&msz, model, &SESSION_FONT_MODEL, 0, 0,
+                             LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+            nw -= msz.x + 2 * 6 /*pill pad*/ + 6 /*gap*/;
+        } else {
+            lv_obj_add_flag(c->lbl_model, LV_OBJ_FLAG_HIDDEN);
+        }
+
         if (nw != c->name_w) {
             c->name_w = nw;
             lv_obj_set_width(c->lbl_name, nw);
         }
     }
 
-    label_set_ellipsized(c->lbl_name, r->label, c->name_font, c->name_w);
+    // Scroll only while the chat is doing something; an idle chat's name
+    // sits parked at the start instead of drawing the eye with motion that
+    // has nothing to report. lv_label_set_long_mode() always restarts the
+    // animation (no same-value guard in LVGL), so only call it on a change.
+    const bool want_scroll = (bucket != SESSION_BUCKET_IDLE);
+    if (want_scroll != c->name_scrolling) {
+        c->name_scrolling = want_scroll;
+        lv_label_set_long_mode(c->lbl_name,
+            want_scroll ? LV_LABEL_LONG_SCROLL : LV_LABEL_LONG_DOT);
+    }
+    set_label_if_changed(c->lbl_name, r->label);
 
     // Context bar: hidden entirely when the percentage is unknown — an empty
     // bar reads as "0% used" (§5).
@@ -921,24 +1078,43 @@ static void chat_card_set_row(ChatCard* c, const SessionRow* r) {
 }
 
 static void focus_set_content(const SessionRow* r) {
-    static const char* const model_names[] = { "", "opus", "sonnet", "haiku", "fable" };
-    const char* model = r->model <= SESSION_MODEL_FABLE ? model_names[r->model] : "";
-    set_label_if_changed(focus_lbl_model, model);
-    // Budget the name against the pill actually rendered (its text width +
-    // padding + a 12px gap) — not a worst case — so a long name runs right up
-    // to the pill. An empty pill would render as a bare chip: hide it with
-    // its text and give the name the full row.
+    // Budget the name against the pill(s) actually rendered (text width +
+    // padding + a small gap, chained right-to-left) — not a worst case — so a
+    // long name runs right up to the nearest pill. An empty pill would
+    // render as a bare chip: hide it with its text and give the name back
+    // that share of the row. Effort sits at the outer/right edge, model
+    // chains off its left — reads left-to-right as "model, effort".
     const int cw = L.scr_w - 2 * CHAT_CARD_PAD_X;
     int nw = cw;
+    lv_obj_t* anchor = nullptr;
+
+    const char* effort = session_effort_text(r->effort);
+    set_label_if_changed(focus_lbl_effort, effort);
+    if (effort[0]) {
+        lv_obj_clear_flag(focus_lbl_effort, LV_OBJ_FLAG_HIDDEN);
+        lv_point_t esz;
+        lv_text_get_size(&esz, effort, &SESSION_FONT_MODEL, 0, 0,
+                         LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        nw -= esz.x + 2 * 12 /*pill pad*/ + 4 /*gap*/;
+        anchor = focus_lbl_effort;
+    } else {
+        lv_obj_add_flag(focus_lbl_effort, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    const char* model = session_model_text(r->model);
+    set_label_if_changed(focus_lbl_model, model);
     if (model[0]) {
         lv_obj_clear_flag(focus_lbl_model, LV_OBJ_FLAG_HIDDEN);
+        if (anchor) lv_obj_align_to(focus_lbl_model, anchor, LV_ALIGN_OUT_LEFT_MID, -4, 0);
+        else        lv_obj_align(focus_lbl_model, LV_ALIGN_TOP_RIGHT, 0, 0);
         lv_point_t sz;
-        lv_text_get_size(&sz, model, &font_styrene_20, 0, 0,
+        lv_text_get_size(&sz, model, &SESSION_FONT_MODEL, 0, 0,
                          LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-        nw = cw - (sz.x + 2 * 12 /*pill pad*/) - 12 /*gap*/;
+        nw -= sz.x + 2 * 12 /*pill pad*/ + 4 /*gap*/;
     } else {
         lv_obj_add_flag(focus_lbl_model, LV_OBJ_FLAG_HIDDEN);
     }
+
     if (nw != focus_card.name_w) {
         focus_card.name_w = nw;
         lv_obj_set_width(focus_card.lbl_name, nw);
@@ -1150,7 +1326,7 @@ static void build_session_views(lv_obj_t* parent) {
 
     // Chat card extras: model pill (quota-pill treatment at the chat card's
     // own text size) + the context line.
-    focus_lbl_model = make_card_label(focus_card.card, &font_styrene_24, COL_TEXT);
+    focus_lbl_model = make_card_label(focus_card.card, &SESSION_FONT_MODEL, COL_TEXT);
     lv_obj_set_style_bg_color(focus_lbl_model, COL_BAR_BG, 0);
     lv_obj_set_style_bg_opa(focus_lbl_model, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(focus_lbl_model, LV_RADIUS_CIRCLE, 0);
@@ -1159,10 +1335,20 @@ static void build_session_views(lv_obj_t* parent) {
     lv_obj_set_style_pad_top(focus_lbl_model, 4, 0);
     lv_obj_set_style_pad_bottom(focus_lbl_model, 4, 0);
     lv_obj_align(focus_lbl_model, LV_ALIGN_TOP_RIGHT, 0, 0);
-    focus_lbl_ctx = make_card_label(focus_card.card, &font_styrene_24, COL_TEXT);
-    lv_obj_align(focus_lbl_ctx, LV_ALIGN_TOP_LEFT, 0, 64);
-    focus_lbl_tok = make_card_label(focus_card.card, &font_styrene_24, COL_TEXT);
-    lv_obj_align(focus_lbl_tok, LV_ALIGN_TOP_RIGHT, 0, 64);
+    // Same pill treatment, chained to the model pill's left in focus_set_content().
+    focus_lbl_effort = make_card_label(focus_card.card, &SESSION_FONT_MODEL, COL_TEXT);
+    lv_obj_set_style_bg_color(focus_lbl_effort, COL_BAR_BG, 0);
+    lv_obj_set_style_bg_opa(focus_lbl_effort, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(focus_lbl_effort, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_left(focus_lbl_effort, 12, 0);
+    lv_obj_set_style_pad_right(focus_lbl_effort, 12, 0);
+    lv_obj_set_style_pad_top(focus_lbl_effort, 4, 0);
+    lv_obj_set_style_pad_bottom(focus_lbl_effort, 4, 0);
+    lv_obj_align(focus_lbl_effort, LV_ALIGN_TOP_RIGHT, 0, 0);
+    focus_lbl_ctx = make_card_label(focus_card.card, &SESSION_FONT_MODEL, COL_TEXT);
+    lv_obj_align(focus_lbl_ctx, LV_ALIGN_TOP_LEFT, 0, SESSION_FOCUS_ROW2_Y);
+    focus_lbl_tok = make_card_label(focus_card.card, &SESSION_FONT_MODEL, COL_TEXT);
+    lv_obj_align(focus_lbl_tok, LV_ALIGN_TOP_RIGHT, 0, SESSION_FOCUS_ROW2_Y);
 
     // ---- SEVERAL-CHATS (§1.4): one-line quota strip + the card list ----
     chats_group = make_session_group(parent);
@@ -1171,19 +1357,19 @@ static void build_session_views(lv_obj_t* parent) {
     const int half = (L.content_w - CHAT_ROW_HALF_GAP) / 2;
     const int strip_bar_w = half - CHAT_ROW_LBL_W - CHAT_ROW_PCT_W - 2 * CHAT_ROW_COL_GAP;
     const int tag_y = L.content_y +
-        (CHAT_ROW_H - lv_font_get_line_height(&font_styrene_24)) / 2;
+        (CHAT_ROW_H - lv_font_get_line_height(&SESSION_FONT_STRIP_TAG)) / 2;
     const int pct_y = L.content_y +
-        (CHAT_ROW_H - lv_font_get_line_height(&font_styrene_28)) / 2;
+        (CHAT_ROW_H - lv_font_get_line_height(&SESSION_FONT_STRIP_PCT)) / 2;
     for (int i = 0; i < 2; i++) {
         const int x0 = L.margin + i * (half + CHAT_ROW_HALF_GAP);
-        cq_tag[i] = make_card_label(chats_group, &font_styrene_24, COL_DIM);
+        cq_tag[i] = make_card_label(chats_group, &SESSION_FONT_STRIP_TAG, COL_DIM);
         lv_obj_set_width(cq_tag[i], CHAT_ROW_LBL_W);
         lv_obj_set_pos(cq_tag[i], x0, tag_y);
         cq_bar[i] = make_bar(chats_group,
                              x0 + CHAT_ROW_LBL_W + CHAT_ROW_COL_GAP,
                              L.content_y + (CHAT_ROW_H - CHAT_ROW_BAR_H) / 2,
                              strip_bar_w, CHAT_ROW_BAR_H);
-        cq_pct[i] = make_card_label(chats_group, &font_styrene_28, COL_TEXT);
+        cq_pct[i] = make_card_label(chats_group, &SESSION_FONT_STRIP_PCT, COL_TEXT);
         lv_obj_set_width(cq_pct[i], CHAT_ROW_PCT_W);
         lv_obj_set_style_text_align(cq_pct[i], LV_TEXT_ALIGN_RIGHT, 0);
         lv_obj_set_pos(cq_pct[i],
@@ -1467,14 +1653,23 @@ void ui_update(const UsageData* data) {
 #endif
 }
 
-// The `✻` status line yields when it has nothing to say (§2.3): no room for
-// it on SEVERAL-CHATS, and nothing for it to say once the focused chat is
-// waiting on you. Everywhere else it stays.
+// The `✻` status line yields when it has nothing to say (§2.3): hidden
+// outright once every chat has closed (nothing left to be lively about), and
+// on either session view once a chat is waiting on you (that already has its
+// own pulsing indicator — a second animation competing for attention is
+// noise, not signal). Driven by s_any_waiting/s_focus_waiting rather than a
+// per-row working/idle bucket: those two are already the view resolver's own
+// stable inputs, so this can't flap out of step with them. An
+// activity-derived version of this flickered in testing — hook events land
+// in a burst during real tool use, so a bucket can bounce through idle and
+// back inside one payload's turnaround.
 static void apply_anim_visibility(void) {
     if (!lbl_anim) return;
     bool hide = false;
 #if BOARD_HAS_SESSION_VIEWS
-    if (view_state == 4 || (view_state == 3 && s_focus_waiting)) hide = true;
+    if (board_caps().has_session_views && s_live_count == 0) hide = true;
+    else if (view_state == 4) hide = s_any_waiting;
+    else if (view_state == 3) hide = s_focus_waiting;
 #endif
     if (hide) lv_obj_add_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
     else      lv_obj_clear_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
@@ -1525,6 +1720,8 @@ static void update_view_state(void) {
         v = 2;  // RESTING — live quota panels
     }
     if (v == view_state) return;
+    Serial.printf("view_state: %d -> %d (live=%d waiting=%d fresh=%d)\n",
+                  view_state, v, s_live_count, s_any_waiting, fresh);
     view_state = v;
     // Instant swap. §2.3's 280 ms RESTING↔chat cross-fade is deliberately
     // deferred — the existing sub-view pattern is instant, and the fade is
@@ -1535,12 +1732,26 @@ static void update_view_state(void) {
 #if BOARD_HAS_SESSION_VIEWS
     if (focus_group) lv_obj_add_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
     if (chats_group) lv_obj_add_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
-    if (v == 3) lv_obj_clear_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
-    else if (v == 4) lv_obj_clear_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
-    else
-#endif
+    if (v == 3 || v == 4) {
+        lv_label_set_text(lbl_title, "Sessions");
+        if (v == 3) lv_obj_clear_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
+        else        lv_obj_clear_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        // Leaving the session view: restore the title now instead of
+        // waiting up to 60s for the next clock minute-tick to overwrite it.
+        lv_label_set_text(lbl_title, "Usage");
+        clock_last_min = -1;
+        lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
+                          LV_OBJ_FLAG_HIDDEN);
+    }
+#else
     lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
                       LV_OBJ_FLAG_HIDDEN);
+#endif
+    Serial.printf("  after swap: usage_hidden=%d focus_hidden=%d chats_hidden=%d\n",
+                  lv_obj_has_flag(usage_group, LV_OBJ_FLAG_HIDDEN),
+                  focus_group ? lv_obj_has_flag(focus_group, LV_OBJ_FLAG_HIDDEN) : -1,
+                  chats_group ? lv_obj_has_flag(chats_group, LV_OBJ_FLAG_HIDDEN) : -1);
     apply_anim_visibility();
 }
 
@@ -1553,7 +1764,13 @@ void ui_tick_anim(void) {
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
+    // Suppressed while a session view is up (title reads "Sessions" there instead
+    // — see the view-swap block in update_view_state()).
+#if BOARD_HAS_SESSION_VIEWS
+    if (clock_base_epoch > 0 && view_state != 3 && view_state != 4) {
+#else
     if (clock_base_epoch > 0) {
+#endif
         time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
         struct tm tmv;
         gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is
