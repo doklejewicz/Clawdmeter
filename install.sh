@@ -4,8 +4,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICE_NAME="claude-usage-daemon"
 SERVICE_FILE="$SCRIPT_DIR/daemon/$SERVICE_NAME.service"
-SESSIONS_SERVICE_NAME="clawdmeter-sessions"
-SESSIONS_SERVICE_FILE="$SCRIPT_DIR/daemon/$SESSIONS_SERVICE_NAME.service"
+# The session-awareness sidecar (issue #135) isn't a separate systemd unit —
+# claude-usage-daemon.sh spawns/supervises it as a child process when
+# hook_port is configured, so the one service above covers both.
 SESSIONS_BIN="$SCRIPT_DIR/daemon/clawdmeter_sessions.py"
 USER_SERVICE_DIR="$HOME/.config/systemd/user"
 CONFIG_FILE="$HOME/.config/claude-usage-monitor/config"
@@ -192,12 +193,13 @@ done
 echo "  All dependencies found"
 echo ""
 
-# Install systemd user services with resolved paths
-echo "[2/4] Installing systemd user services..."
+# Install the systemd user service with resolved paths. One unit: the
+# session-awareness sidecar (if configured) runs as its child, not a
+# separate unit — see claude-usage-daemon.sh's start_sessions_sidecar().
+echo "[2/4] Installing systemd user service..."
 mkdir -p "$USER_SERVICE_DIR"
 DAEMON_BIN="$SCRIPT_DIR/daemon/$SERVICE_NAME.sh"
 sed "s|DAEMON_PATH|${DAEMON_BIN}|g" "$SERVICE_FILE" > "$USER_SERVICE_DIR/$SERVICE_NAME.service"
-sed "s|DAEMON_PATH|${SESSIONS_BIN}|g" "$SESSIONS_SERVICE_FILE" > "$USER_SERVICE_DIR/$SESSIONS_SERVICE_NAME.service"
 systemctl --user daemon-reload
 
 # Interactive daemon configuration: which plans to poll, live session
@@ -210,13 +212,8 @@ configure_clock
 configure_chime
 echo ""
 
-# Enable services (the sessions sidecar only when the feature is on)
-echo "[4/4] Enabling services..."
+echo "[4/4] Enabling service..."
 systemctl --user enable "$SERVICE_NAME"
-if [ -n "$(current_config_value hook_port)" ]; then
-    systemctl --user enable "$SESSIONS_SERVICE_NAME"
-    echo "  Enabled $SESSIONS_SERVICE_NAME (live session awareness)"
-fi
 
 echo ""
 echo "=== Done! ==="
@@ -234,11 +231,7 @@ echo "  6. Start the daemon: systemctl --user start $SERVICE_NAME"
 echo ""
 echo "Useful commands:"
 echo "  systemctl --user status $SERVICE_NAME    # check status"
-echo "  journalctl --user -u $SERVICE_NAME -f    # view logs"
+echo "  journalctl --user -u $SERVICE_NAME -f    # view logs (sidecar logs to the same stream)"
 echo "  systemctl --user restart $SERVICE_NAME   # restart"
 echo "  systemctl --user stop $SERVICE_NAME      # stop"
-if [ -n "$(current_config_value hook_port)" ]; then
-    echo "  systemctl --user start $SESSIONS_SERVICE_NAME   # live session awareness sidecar"
-    echo "  journalctl --user -u $SESSIONS_SERVICE_NAME -f  # sidecar logs"
-fi
 echo ""

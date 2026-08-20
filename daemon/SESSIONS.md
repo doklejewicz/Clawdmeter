@@ -11,22 +11,35 @@ you have to install; without it the device behaves exactly as it does today.
 ## How it works
 
 ```
-Claude Code sessions ──HTTP hooks (127.0.0.1)──▶ clawdmeter_sessions.py
-   transcripts *.jsonl ─────context tokens─────▶   (state machine + sort)
-   <config-dir>/sessions/<pid>.json ─liveness──▶        │
-                                                        ▼ atomic write on change
-                                            ~/.clawdmeter/sessions.json
-                                                        │ 5 s tick, on change
-claude-usage-daemon.sh ──BLE GATT SS …0005─────────────▶ Clawdmeter firmware
+claude-usage-daemon.sh (bash, one process — spawns the sidecar as a child)
+│
+├── clawdmeter_sessions.py (child) ◀──HTTP hooks (127.0.0.1)── Claude Code sessions
+│      state machine + sort        ◀────context tokens──────── transcripts *.jsonl
+│              │                   ◀───────liveness──────────── <config-dir>/sessions/<pid>.json
+│              ▼ atomic write on change
+│   ~/.claude/clawdmeter-sessions.json
+│              │ 5 s tick, on change
+└── BLE GATT SS …0005 ─────────────────────────────────────────▶ Clawdmeter firmware
 ```
 
 The sidecar (`daemon/clawdmeter_sessions.py`, Python 3 stdlib only) listens on
 loopback for hook POSTs, keeps a table of live sessions, sorts it
 attention-first, fits it to a byte budget, and writes the finished wire payload
-to `~/.clawdmeter/sessions.json`. The bash daemon ships that payload to the SS
-GATT characteristic whenever the file's content changes. The listener is a
-read-only observer: it answers `204 No Content` and can never block a tool call
-or approve a permission.
+to `~/.claude/clawdmeter-sessions.json`. The bash daemon ships that payload to
+the SS GATT characteristic whenever the file's content changes. The listener
+is a read-only observer: it answers `204 No Content` and can never block a
+tool call or approve a permission.
+
+**One process on Linux.** `claude-usage-daemon.sh` spawns the sidecar as a
+child (`start_sessions_sidecar()`) whenever `hook_port` is configured, and
+kills it on exit — shipping session data over BLE is pointless if this daemon
+isn't running to do the shipping, so there's no separate systemd unit to
+start/stop/enable. A per-tick health check respawns the sidecar if it crashes
+without restarting the whole daemon (and its BLE connection) over it. The
+sidecar is still a standalone, independently-runnable script (see "Run the
+sidecar" below) — useful for local debugging or the future macOS/Windows
+integration, which will supervise it differently (those hosts' own daemons are
+already Python; see "macOS / Windows" below).
 
 ## Setup (Linux)
 
@@ -76,21 +89,23 @@ or approve a permission.
    are appended alongside, not instead. New sessions pick hooks up on start;
    already-running sessions keep their old hook set.
 
-3. **Run the sidecar** — `./install.sh` installs and enables the
-   `clawdmeter-sessions` systemd user unit:
+3. **Run it** — nothing extra to start. `claude-usage-daemon.sh` spawns the
+   sidecar itself once `hook_port` is set, so the existing
+   `claude-usage-daemon` systemd unit (`./install.sh`) covers both:
 
    ```bash
-   systemctl --user start clawdmeter-sessions
-   journalctl --user -u clawdmeter-sessions -f
+   systemctl --user restart claude-usage-daemon   # picks up a newly-set hook_port
+   journalctl --user -u claude-usage-daemon -f    # sidecar logs to the same stream
    ```
 
-   Or run it in a terminal: `python3 daemon/clawdmeter_sessions.py`
+   For local debugging, the sidecar still runs standalone in a terminal:
+   `python3 daemon/clawdmeter_sessions.py`
 
 4. **Verify** — open a Claude Code session, then:
 
    ```bash
-   curl -s http://127.0.0.1:45999/          # current wire payload (loopback debug)
-   cat ~/.clawdmeter/sessions.json          # what the daemon will ship
+   curl -s http://127.0.0.1:45999/                    # current wire payload (loopback debug)
+   cat ~/.claude/clawdmeter-sessions.json             # what the daemon will ship
    ```
 
 ## Wire format
@@ -99,7 +114,7 @@ The payload is `{"ss":[...]}` with one positional row per session, already
 sorted attention-first (waiting, working, idle; most recent first within each):
 
 ```
-[sid, label, state, ctx, elapsed_s, model, tool, ntools, nagents, tdone, ttotal, tok]
+[sid, label, state, ctx, elapsed_s, model, tool, ntools, nagents, tdone, ttotal, tok, effort]
 ```
 
 | # | Field | Meaning |
@@ -115,6 +130,7 @@ sorted attention-first (waiting, working, idle; most recent first within each):
 | 8 | `nagents` | Subagents currently in flight |
 | 9–10 | `tdone` / `ttotal` | Todo counts; badge hidden when `ttotal` is 0 |
 | 11 | `tok` | Context tokens used, in 1k units (rounded to nearest) — the absolute number behind `ctx`, from the same transcript read. `-1` exactly when `ctx` is `-1` |
+| 12 | `effort` | Reasoning effort at the last transcript read: `0` unknown, `1` low, `2` medium, `3` high, `4` xhigh, `5` max. Read from the transcript's top-level `effort` field on the newest assistant record (sibling of `message`, not nested under it) |
 
 Fields are append-only: firmware ignores indices it doesn't know, and new
 fields only ever go on the end.
@@ -150,6 +166,12 @@ rosters and transcripts across several Claude config dirs.
   activity timeout, so a chat parked on a permission prompt survives
   indefinitely. Roster absence is acted on after a 30 s grace; a 6 h staleness
   sweep backstops an unreadable roster.
+- **Discovery.** New sessions normally show up the instant their first hook
+  fires. The periodic sweep (every 5 s) also scans the roster for entries
+  the daemon hasn't seen a hook from at all yet — a chat already open before
+  the sidecar started, or one sitting untouched ever since — and adopts any
+  with a live pid, backfilling state from history the same way `SessionStart`
+  does. Without this, such a session stays invisible until it does something.
 - **Context % is a heuristic** read from the transcript tail
   (`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`),
   re-read on SessionStart/Stop/PostCompact. Good for a glanceable bar, not for

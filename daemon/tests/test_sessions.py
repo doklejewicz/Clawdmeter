@@ -16,8 +16,9 @@ from daemon.clawdmeter_sessions import (
     STATE_RUNNING_TOOL, STATE_COMPACTING, STATE_WAITING_PERMISSION,
     STATE_WAITING_QUESTION, STATE_WAITING_INPUT, STATE_ERROR,
     SessionTable, clean_prompt_label, compute_window, context_percent,
-    elide_label, encode_payload, fit_payload, model_code,
-    read_custom_title_from_transcript, state_bucket, tokens_k, tool_code,
+    effort_code, elide_label, encode_payload, fit_payload, model_code,
+    read_custom_title_from_transcript, read_first_prompt_from_transcript,
+    state_bucket, tokens_k, tool_code,
 )
 
 SID = "a3f10c2e-0000-4000-8000-000000000001"
@@ -539,9 +540,9 @@ def test_wire_row_shape_and_codes():
     rows = json.loads(t.project(4096))["ss"]
     assert len(rows) == 1
     row = rows[0]
-    assert len(row) == 12
+    assert len(row) == 13
     (sid, label, state, ctx, elapsed, model, tool,
-     ntools, nagents, tdone, ttotal, tok) = row
+     ntools, nagents, tdone, ttotal, tok, effort) = row
     assert sid == SID[:2] and len(sid) == 2
     assert label == "clawdmeter"          # basename(cwd) fallback
     assert state == STATE_RUNNING_TOOL
@@ -551,6 +552,7 @@ def test_wire_row_shape_and_codes():
     assert tool == 1                       # Bash
     assert (ntools, nagents, tdone, ttotal) == (1, 1, 0, 0)
     assert tok == -1                       # unknown together with ctx
+    assert effort == 0                     # no transcript -> unknown
 
 
 def test_model_and_tool_code_tables():
@@ -568,16 +570,42 @@ def test_model_and_tool_code_tables():
     assert tool_code(None) == 0
 
 
+def test_effort_code_table():
+    assert effort_code("low") == 1
+    assert effort_code("medium") == 2
+    assert effort_code("high") == 3
+    assert effort_code("xhigh") == 4
+    assert effort_code("max") == 5
+    assert effort_code("HIGH") == 3        # case-insensitive
+    assert effort_code("extreme") == 0     # unrecognized -> unknown
+    assert effort_code(None) == 0
+
+
+def test_effort_read_from_transcript_and_on_the_wire(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    rec = {"type": "assistant", "isSidechain": False, "effort": "xhigh",
+           "message": {"model": "claude-sonnet-4-5",
+                       "usage": {"input_tokens": 1000}}}
+    transcript.write_text(json.dumps(rec) + "\n")
+    t = make_table()
+    t.handle_event(ev("SessionStart", transcript_path=str(transcript)))
+    assert sess(t).effort == 4             # xhigh
+    row = json.loads(t.project(4096))["ss"][0]
+    assert row[12] == 4                    # effort appended after tok
+
+
 # ---------------------------------------------------------------------------
 # Roster liveness — §4.2: grace, unreadable roster, name pickup
 # ---------------------------------------------------------------------------
 
-def _write_roster(cdir, session_id, pid, name=None):
+def _write_roster(cdir, session_id, pid, name=None, cwd=None):
     sdir = cdir / "sessions"
     sdir.mkdir(parents=True, exist_ok=True)
     rec = {"pid": pid, "sessionId": session_id}
     if name:
         rec["name"] = name
+    if cwd:
+        rec["cwd"] = cwd
     (sdir / f"{pid}.json").write_text(json.dumps(rec))
 
 
@@ -635,6 +663,21 @@ def test_clean_prompt_label_collapses_whitespace_and_caps_length():
     assert clean_prompt_label(42) is None
 
 
+def test_clean_prompt_label_strips_injected_context_tags():
+    # A session opened by clicking a file, no typed message: the whole
+    # "prompt" is harness plumbing, not user text.
+    assert clean_prompt_label(
+        "<ide_opened_file>The user opened foo.py</ide_opened_file>"
+    ) is None
+    # Real text alongside a context block: keep the text, drop the block.
+    assert clean_prompt_label(
+        "<ide_selection>lines 1-3</ide_selection>fix this bug"
+    ) == "fix this bug"
+    assert clean_prompt_label(
+        "add dark mode\n<system-reminder>unrelated context</system-reminder>"
+    ) == "add dark mode"
+
+
 def test_first_prompt_label_takes_priority_over_roster_and_cwd(tmp_path):
     clock = FakeClock(1000.0)
     t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
@@ -649,6 +692,72 @@ def test_first_prompt_label_sticks_to_the_first_turn():
     t.handle_event(ev("UserPromptSubmit", prompt="first question"))
     t.handle_event(ev("UserPromptSubmit", prompt="second question"))
     assert sess(t).label() == "first question"
+
+
+def test_first_prompt_noise_does_not_let_a_later_turn_claim_the_label():
+    # First turn is pure harness plumbing (e.g. a session opened by clicking
+    # a file, no typed text) -> cleans to nothing. A later turn's real text
+    # must NOT retroactively become "the first prompt" (regression: was
+    # showing an unrelated later command, like "do it again", as the name).
+    t = make_table()
+    t.handle_event(ev("UserPromptSubmit",
+                      prompt="<ide_opened_file>opened foo.py</ide_opened_file>"))
+    t.handle_event(ev("UserPromptSubmit", prompt="do it again"))
+    assert sess(t).first_prompt is None
+
+
+def test_read_first_prompt_from_transcript(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    lines = [
+        {"type": "user", "message": {"content": "the real first prompt"}},
+        {"type": "assistant", "message": {"content": "ok"}},
+        {"type": "user", "message": {"content": "a later, different message"}},
+    ]
+    transcript.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+    assert read_first_prompt_from_transcript(str(transcript)) == "the real first prompt"
+
+
+def test_read_first_prompt_content_block_form(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    lines = [
+        {"type": "user", "isSidechain": True, "message": {"content": "subagent turn, skip"}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "irrelevant"},
+        ]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+    # The first non-sidechain turn is the tool_result-only one -> no text
+    # blocks -> cleans to "" (a first turn that exists but is unusable, NOT
+    # "no turn yet") — matches the sticky-first-turn contract.
+    assert read_first_prompt_from_transcript(str(transcript)) == ""
+
+
+def test_read_first_prompt_missing_transcript_returns_none(tmp_path):
+    assert read_first_prompt_from_transcript(str(tmp_path / "nope.jsonl")) is None
+
+
+def test_resumed_session_uses_historical_first_prompt_not_the_resume_message(tmp_path):
+    # Resuming a chat from weeks ago: the transcript already has the real
+    # first turn on disk before this daemon process ever saw the session.
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "message": {"content": "add dark mode"}}) + "\n"
+    )
+    t = make_table()
+    t.handle_event(ev("SessionStart", transcript_path=str(transcript)))
+    assert sess(t).first_prompt == "add dark mode"
+    # Continuing the resumed chat must not overwrite it.
+    t.handle_event(ev("UserPromptSubmit", prompt="do it again"))
+    assert sess(t).first_prompt == "add dark mode"
+
+
+def test_brand_new_session_still_uses_the_live_first_prompt(tmp_path):
+    # No transcript written yet (SessionStart can fire before the first
+    # message is persisted) -> must NOT freeze first_prompt_seen early.
+    t = make_table()
+    t.handle_event(ev("SessionStart", transcript_path=str(tmp_path / "new.jsonl")))
+    t.handle_event(ev("UserPromptSubmit", prompt="a genuinely new first prompt"))
+    assert sess(t).first_prompt == "a genuinely new first prompt"
 
 
 def test_empty_prompt_falls_back_to_roster_name(tmp_path):
@@ -683,3 +792,49 @@ def test_roster_entry_with_dead_pid_is_not_liveness(tmp_path):
     clock.tick(mod.ROSTER_GRACE_S + 1)
     assert t.sweep() is True
     assert SID not in t.sessions
+
+
+def _write_transcript(cdir, cwd, session_id, lines):
+    munged = mod.munge_cwd(cwd)
+    pdir = cdir / "projects" / munged
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / f"{session_id}.jsonl").write_text(
+        "\n".join(json.dumps(l) for l in lines) + "\n"
+    )
+
+
+def test_sweep_discovers_a_session_never_seen_via_hooks(tmp_path):
+    # A chat already open before this daemon process started (or one that's
+    # been sitting untouched since) — no hook has ever fired for it, so
+    # without discovery it stays invisible forever.
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    cwd = "/home/x/clawdmeter"
+    _write_roster(tmp_path, SID, os.getpid(), name="clawdmeter-c5", cwd=cwd)
+    _write_transcript(tmp_path, cwd, SID, [
+        {"type": "user", "message": {"content": "add dark mode"}},
+    ])
+    assert t.sweep() is True
+    s = sess(t)
+    assert s.state == STATE_IDLE
+    assert s.roster_name == "clawdmeter-c5"
+    assert s.first_prompt == "add dark mode"   # backfilled, same as SessionStart
+    assert s.label() == "add dark mode"
+
+
+def test_sweep_does_not_discover_a_dead_process(tmp_path):
+    t = make_table(config_dirs=[str(tmp_path)])
+    _write_roster(tmp_path, SID, None, cwd="/home/x/clawdmeter")   # dead pid
+    t.sweep()
+    assert SID not in t.sessions
+
+
+def test_sweep_discovery_does_not_duplicate_on_repeat(tmp_path):
+    clock = FakeClock(1000.0)
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), cwd="/home/x/clawdmeter")
+    assert t.sweep() is True
+    assert len(t.sessions) == 1
+    clock.tick(5.0)
+    assert t.sweep() is False          # already known, alive, nothing changed
+    assert len(t.sessions) == 1

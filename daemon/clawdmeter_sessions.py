@@ -8,11 +8,11 @@ compact wire format the firmware reads from the SS GATT characteristic
 
 Runs two ways:
 
-- **Standalone (Linux)** — `python3 clawdmeter_sessions.py` (or via the
-  `clawdmeter-sessions.service` systemd user unit). Serves HTTP on
-  127.0.0.1:<hook_port> and atomically writes `~/.clawdmeter/sessions.json`
-  on every state change; the bash daemon ships that file's payload over BLE
-  on its existing 5 s tick.
+- **Standalone (Linux)** — `python3 clawdmeter_sessions.py`, normally spawned
+  as a child of `claude-usage-daemon.sh` rather than run directly (see
+  daemon/SESSIONS.md). Serves HTTP on 127.0.0.1:<hook_port> and atomically
+  writes `~/.claude/clawdmeter-sessions.json` on every state change; the bash
+  daemon ships that file's payload over BLE on its existing 5 s tick.
 - **Library** — the Python daemon (macOS/Windows) can import `SessionTable`,
   `fit_payload`, etc. and run the listener in-process.
 
@@ -70,6 +70,7 @@ WORKING_STATES = frozenset(
 )
 
 MODEL_CODES = (("opus", 1), ("sonnet", 2), ("haiku", 3), ("fable", 4))
+EFFORT_CODES = (("low", 1), ("medium", 2), ("high", 3), ("xhigh", 4), ("max", 5))
 
 TOOL_CODES = {
     "Bash": 1,
@@ -109,7 +110,7 @@ CONFIG_FILE = os.path.join(
     os.path.expanduser("~"), ".config", "claude-usage-monitor", "config"
 )
 DEFAULT_SESSIONS_FILE = os.path.join(
-    os.path.expanduser("~"), ".clawdmeter", "sessions.json"
+    os.path.expanduser("~"), ".claude", "clawdmeter-sessions.json"
 )
 
 # Hook events the state machine consumes. Verified against the Claude Code
@@ -204,18 +205,38 @@ def model_code(model_str):
     return 0
 
 
+def effort_code(effort_str):
+    if not effort_str:
+        return 0
+    lowered = effort_str.lower()
+    for name, code in EFFORT_CODES:
+        if name == lowered:
+            return code
+    return 0
+
+
 def tool_code(tool_name):
     return TOOL_CODES.get(tool_name or "", 0)
 
 
 PROMPT_LABEL_MAX = 80  # raw capture cap; elide_label narrows further to the wire budget
 
+# The harness weaves context blocks (<ide_opened_file>, <ide_selection>,
+# <system-reminder>, ...) directly into the prompt text a UserPromptSubmit
+# hook receives — not just editor-side display. Left in, a session opened by
+# clicking a file (no typed message at all) shows its label as raw IDE
+# plumbing instead of falling through to a real name. Stripped generically by
+# tag shape rather than a hardcoded tag list, since the harness can add more.
+_TAG_BLOCK_RE = re.compile(r"<([a-zA-Z][\w-]*)\b[^>]*>.*?</\1>", re.DOTALL)
+
 
 def clean_prompt_label(text):
-    """First-user-prompt label: collapse whitespace to single spaces and cap
-    length. Returns None for anything not worth using (empty/non-string)."""
+    """First-user-prompt label: strip injected context tag blocks, collapse
+    whitespace to single spaces, and cap length. Returns None for anything
+    not worth using (empty/non-string/only-tags)."""
     if not isinstance(text, str):
         return None
+    text = _TAG_BLOCK_RE.sub(" ", text)
     cleaned = " ".join(text.split())
     if not cleaned:
         return None
@@ -313,8 +334,10 @@ def short_sid(session_id):
 def read_context_from_transcript(path):
     """Newest non-sidechain assistant record's usage:
     input + cache_read_input + cache_creation_input tokens.
-    Returns (tokens, model_str), or (None, None) when unreadable/absent.
-    Reads only the file tail — transcripts grow to many MB."""
+    Returns (tokens, model_str, effort_str), or (None, None, None) when
+    unreadable/absent. Reads only the file tail — transcripts grow to many MB.
+    "effort" is a top-level field on the same record (reasoning effort: low/
+    medium/high/xhigh/max), not nested under "message"."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -323,7 +346,7 @@ def read_context_from_transcript(path):
                 fh.readline()  # discard the partial line
             data = fh.read()
     except OSError:
-        return (None, None)
+        return (None, None, None)
 
     for line in reversed(data.decode("utf-8", "replace").splitlines()):
         line = line.strip()
@@ -348,8 +371,64 @@ def read_context_from_transcript(path):
             v = usage.get(field)
             if isinstance(v, (int, float)):
                 tokens += int(v)
-        return (tokens, message.get("model"))
-    return (None, None)
+        return (tokens, message.get("model"), rec.get("effort"))
+    return (None, None, None)
+
+
+def _user_message_text(message):
+    """Human-authored text from a transcript "user" record's message.
+    content is either a plain string or a list of blocks; a turn that's
+    purely a tool_result (the harness's own reply to a tool call, not
+    something typed) has no text blocks and yields ""."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return " ".join(p for p in parts if p)
+    return ""
+
+
+def read_first_prompt_from_transcript(path):
+    """The session's first non-sidechain "user" turn, read from the START of
+    the file forward — unlike every other reader here, which wants the
+    newest record. A resumed old session's first hook of the CURRENT daemon
+    process's lifetime is not the session's first prompt ever; without this,
+    resuming a past chat (or the sidecar restarting mid-conversation) makes
+    whatever gets typed next masquerade as "the first prompt" instead of
+    whatever actually opened the chat, possibly weeks earlier.
+
+    Only the first turn is ever considered, usable or not (mirrors the
+    live-hook path's stickiness — see Session.first_prompt_seen): a noisy
+    first turn must not let a later turn claim the label either.
+
+    Returns None if no user turn exists yet at all (transcript missing/empty
+    — the session may still be genuinely brand new, so the caller must NOT
+    treat this as "seen" and should keep waiting for the live hook); ""
+    if a first turn exists but cleans to nothing (pure harness noise);
+    otherwise the cleaned text."""
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("type") != "user":
+                continue
+            if rec.get("isSidechain"):
+                continue
+            return clean_prompt_label(_user_message_text(rec.get("message"))) or ""
+    return None
 
 
 def read_custom_title_from_transcript(path):
@@ -464,8 +543,8 @@ class Session:
     __slots__ = (
         "session_id", "sid", "state", "state_since", "last_event_at",
         "roster_name", "cwd", "transcript_path", "current_tool", "open_tools",
-        "nagents", "tdone", "ttotal", "ctx", "tok", "model", "missing_since",
-        "first_prompt", "custom_title",
+        "nagents", "tdone", "ttotal", "ctx", "tok", "model", "effort", "missing_since",
+        "first_prompt", "first_prompt_seen", "custom_title",
     )
 
     def __init__(self, session_id, now):
@@ -485,12 +564,21 @@ class Session:
         self.ctx = -1
         self.tok = -1  # context tokens in 1k units; -1 whenever ctx is -1
         self.model = 0
+        self.effort = 0  # reasoning effort at the last transcript read; session_effort_t
         self.missing_since = None  # first time the roster didn't vouch for us
         # First user prompt, cleaned + capped (see _clean_prompt_label) - a
         # more useful label than the host's auto-derived "<dir>-xx" name, at
         # the cost of prompt text becoming device-visible (opt-in tradeoff,
         # see SESSIONS.md's privacy note).
         self.first_prompt = None
+        # Set the instant the first UserPromptSubmit lands, independent of
+        # whether it produced a usable first_prompt. Without this, a first
+        # turn that's pure harness noise (e.g. a session opened by clicking a
+        # file, no typed text — clean_prompt_label returns None) would leave
+        # first_prompt None and let a LATER turn's text ("do it again") claim
+        # the "first prompt" label instead — a mid-conversation aside standing
+        # in for a name, not the first turn's own words.
+        self.first_prompt_seen = False
         # User-set chat title (renamed in the editor's session list), read
         # from the transcript's "custom-title" events - see
         # read_custom_title_from_transcript(). Takes priority over
@@ -570,7 +658,8 @@ class SessionTable:
             sess.current_tool = None
             sess.open_tools.clear()
             self._set_state(sess, STATE_THINKING, now)
-            if sess.first_prompt is None:
+            if not sess.first_prompt_seen:
+                sess.first_prompt_seen = True
                 cleaned = clean_prompt_label(payload.get("prompt"))
                 if cleaned:
                     sess.first_prompt = cleaned
@@ -672,9 +761,24 @@ class SessionTable:
         path = sess.transcript_path or self._guess_transcript(sess)
         if not path:
             return
-        tokens, model_str = read_context_from_transcript(path)
+        # Backfill from history on the first call we can (normally
+        # SessionStart): a resumed chat, or a session the daemon only just
+        # started watching (sidecar restart mid-conversation), already has a
+        # real first turn on disk that a live UserPromptSubmit would
+        # otherwise never surface. None here means no user turn exists yet
+        # (still genuinely new) — leave first_prompt_seen False so the live
+        # hook gets its normal chance.
+        if not sess.first_prompt_seen:
+            found = read_first_prompt_from_transcript(path)
+            if found is not None:
+                sess.first_prompt_seen = True
+                if found:
+                    sess.first_prompt = found
+        tokens, model_str, effort_str = read_context_from_transcript(path)
         if model_str:
             sess.model = model_code(model_str)
+        if effort_str:
+            sess.effort = effort_code(effort_str)
         sess.ctx = context_percent(tokens, model_str, self.pinned_window_k)
         # tok mirrors the SAME read: the same token sum in 1k units, not divided
         # by the window. Forced to -1 whenever ctx is -1 so the pair can never
@@ -699,14 +803,13 @@ class SessionTable:
     # -- liveness sweep (§4.2) ------------------------------------------------
 
     def sweep(self):
-        """Roster-based liveness + 6 h staleness backstop + label refresh.
-        Returns True if anything wire-visible changed."""
+        """Roster-based liveness + discovery + 6 h staleness backstop + label
+        refresh. Returns True if anything wire-visible changed."""
         now = self.now_fn()
         changed = False
         with self._lock:
-            if not self.sessions:
-                return False
             roster, readable = load_roster(self.config_dirs)
+
             for session_id, sess in list(self.sessions.items()):
                 if now - sess.last_event_at > STALE_SWEEP_S:
                     del self.sessions[session_id]
@@ -730,6 +833,31 @@ class SessionTable:
                     elif now - sess.missing_since > ROSTER_GRACE_S:
                         del self.sessions[session_id]
                         changed = True
+
+            # Discovery: a roster entry with no session_id in our table yet
+            # is a chat the daemon has never seen a hook from — either it was
+            # already open before this process started, or it's been sitting
+            # untouched ever since (nothing to react to). Without this it
+            # stays invisible until it does something; every other session
+            # gets backfilled from history at SessionStart (_refresh_context),
+            # so give these the same treatment here instead of waiting.
+            if readable:
+                for session_id, rec in roster.items():
+                    if session_id in self.sessions:
+                        continue
+                    if not pid_alive(rec.get("pid"), rec.get("procStart")):
+                        continue
+                    sess = Session(session_id, now)
+                    name = rec.get("name")
+                    if isinstance(name, str) and name:
+                        sess.roster_name = name
+                    cwd = rec.get("cwd")
+                    if isinstance(cwd, str) and cwd:
+                        sess.cwd = cwd
+                    self._set_state(sess, STATE_IDLE, now)
+                    self._refresh_context(sess)
+                    self.sessions[session_id] = sess
+                    changed = True
         return changed
 
     # -- projection (§5) ------------------------------------------------------
@@ -737,7 +865,8 @@ class SessionTable:
     def rows(self):
         """Full-label rows, already sorted: (bucket, -last_event_at).
         Row: [sid, label, state, ctx, elapsed_s, model, tool, ntools,
-              nagents, tdone, ttotal, tok] — append-only, like the codes."""
+              nagents, tdone, ttotal, tok, effort] — append-only, like the
+        codes."""
         now = self.now_fn()
         with self._lock:
             ordered = sorted(
@@ -758,6 +887,7 @@ class SessionTable:
                     s.tdone,
                     s.ttotal,
                     s.tok,
+                    s.effort,
                 ]
                 for s in ordered
             ]

@@ -2,7 +2,15 @@
 # Claude Usage Tracker Daemon (BLE)
 # Reads Claude Code OAuth token, polls usage via API, sends to ESP32 over BLE GATT.
 # Auto-connects and reconnects to the Clawdmeter BLE device.
-# Dependencies: curl, awk, bluetoothctl
+# Also supervises the optional session-awareness sidecar (clawdmeter_sessions.py,
+# issue #135) as a child process when hook_port is configured — one process to
+# start/stop/systemd-manage, since shipping session data over BLE is pointless
+# if this daemon isn't running to ship it. See daemon/SESSIONS.md.
+# Dependencies: curl, awk, bluetoothctl, python3 (sidecar only)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SESSIONS_BIN="$SCRIPT_DIR/clawdmeter_sessions.py"
+SESSIONS_PID=""
 
 DEVICE_NAME="Clawdmeter"
 MAC_RE='([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}'
@@ -11,7 +19,7 @@ SERVICE_UUID="4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID="4c41555a-4465-7669-6365-000000000004"
 SS_CHAR_UUID="4c41555a-4465-7669-6365-000000000005"  # live session rows (issue #135)
-SESSIONS_FILE="$HOME/.clawdmeter/sessions.json"
+SESSIONS_FILE="$HOME/.claude/clawdmeter-sessions.json"
 POLL_INTERVAL=60
 TICK=5
 SAVED_MAC_FILE="$HOME/.config/claude-usage-monitor/ble-address"
@@ -24,6 +32,44 @@ LAST_SESSIONS_SIG=""
 
 log() {
     echo "[$(date '+%H:%M:%S')] $1"
+}
+
+# Last-wins `key = value` lookup in the shared config file; trailing comments
+# stripped. Empty if unset. Mirrors clawdmeter_sessions.py's own
+# read_config_value() and install.sh's current_config_value() — three
+# implementations of the same one-liner because bash/python don't share code,
+# not because the format differs.
+read_config_value() {
+    local key="$1"
+    [ -f "$CONFIG_FILE" ] || return 0
+    grep -E "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE" | tail -1 \
+        | tr -d '\r' \
+        | sed -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*(#.*)?\$//"
+}
+
+# Start the sidecar iff the feature is configured (hook_port set) and it
+# isn't already running. Safe to call repeatedly — used both at startup and
+# as a per-tick health check, so a crashed sidecar is respawned without
+# restarting this whole daemon (and its BLE connection) over it.
+start_sessions_sidecar() {
+    local port
+    port=$(read_config_value hook_port)
+    [ -z "$port" ] && return 0   # feature off — nothing to run
+    if [ -n "$SESSIONS_PID" ] && kill -0 "$SESSIONS_PID" 2>/dev/null; then
+        return 0   # already running
+    fi
+    log "Starting session-awareness sidecar (hook_port=$port)..."
+    python3 "$SESSIONS_BIN" &
+    SESSIONS_PID=$!
+}
+
+stop_sessions_sidecar() {
+    [ -n "$SESSIONS_PID" ] || return 0
+    if kill -0 "$SESSIONS_PID" 2>/dev/null; then
+        kill "$SESSIONS_PID" 2>/dev/null
+        wait "$SESSIONS_PID" 2>/dev/null
+    fi
+    SESSIONS_PID=""
 }
 
 # --- Multi config-dir support ---------------------------------------------
@@ -351,13 +397,14 @@ write_gatt_bytes() {
 }
 
 # --- Live session awareness (issue #135) -----------------------------------
-# The clawdmeter-sessions sidecar (see SESSIONS.md) listens for Claude Code
-# hook events and writes an already-fitted wire payload to
-# ~/.clawdmeter/sessions.json on every session state change. On the existing
-# 5s tick, ship that payload to the SS characteristic whenever the file's
-# content changed. Fully inert when the file doesn't exist (feature off /
-# sidecar not running) and when the firmware doesn't expose the characteristic
-# (older firmware) — no errors, no log spam.
+# The session sidecar (spawned above by start_sessions_sidecar(); see
+# SESSIONS.md) listens for Claude Code hook events and writes an
+# already-fitted wire payload to ~/.claude/clawdmeter-sessions.json on every
+# session state change. On the existing 5s tick, ship that payload to the SS
+# characteristic whenever the file's content changed. Fully inert when the
+# file doesn't exist (feature off / sidecar not running) and when the
+# firmware doesn't expose the characteristic (older firmware) — no errors,
+# no log spam.
 maybe_send_sessions() {
     [ -f "$SESSIONS_FILE" ] || return 0
     local sig
@@ -560,6 +607,7 @@ poll() {
 
 cleanup() {
     stop_notify_subscriber
+    stop_sessions_sidecar
     log "Daemon stopped"
     exit 0
 }
@@ -568,6 +616,8 @@ trap cleanup INT TERM
 
 log "=== Claude Usage Tracker Daemon (BLE) ==="
 log "Poll interval: ${POLL_INTERVAL}s"
+
+start_sessions_sidecar
 
 BACKOFF=1
 
@@ -625,6 +675,7 @@ while true; do
             poll && LAST_POLL=$NOW
         fi
         maybe_send_sessions
+        start_sessions_sidecar   # no-op if already running; respawns if it crashed
         sleep "$TICK"
     done
 
