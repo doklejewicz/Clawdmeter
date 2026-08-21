@@ -146,6 +146,61 @@ fields only ever go on the end.
 The sidecar also honors `config_dirs` (shared with the daemons) to find session
 rosters and transcripts across several Claude config dirs.
 
+## Docker / devcontainer sessions
+
+Claude Code running inside a container can show up here too, with **no code
+changes** — the sidecar already reads rosters/transcripts from plain files and
+listens for hooks over plain loopback HTTP; a container just needs to be
+configured so those things actually reach it the way a host process's already
+do:
+
+1. **Hook connectivity.** The listener binds `127.0.0.1` only (see Privacy
+   below), and a container's `127.0.0.1` is its *own* loopback, not the
+   host's. Run the container with `--network=host` (Linux-only) so they're
+   the same interface — hooks then reach the sidecar with no proxying.
+2. **Correct liveness.** `pid_alive()` reads `/proc/<pid>/stat` — a PID
+   recorded inside a container's own PID namespace doesn't correspond to
+   that same process on the host, so liveness would read wrong (or match an
+   unrelated host process reusing the number). Run with `--pid=host` so the
+   container's processes carry their real host PIDs.
+3. **Visible config.** Bind-mount a Claude config dir into the container at
+   its normal `~/.claude` path, and add that dir (from the *host's* path to
+   it) to `config_dirs`.
+
+Example `devcontainer.json`:
+
+```jsonc
+{
+  "runArgs": ["--network=host", "--pid=host"],
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"
+  ]
+}
+```
+
+**Keep separate projects on separate config dirs.** Bind-mounting the same
+`~/.claude` into every container merges their credentials, rosters, and
+transcripts into one pool — fine for "my personal projects," not fine for
+"client A's container shouldn't see client B's session history." Give each
+project (or client) its own dedicated dir instead — `~/.claude-clientA`,
+`~/.claude-clientB` — each with its own separate login, mounted only into
+that project's own container(s). Isolation happens at the mount (one dir per
+project, never shared across containers you want kept apart); aggregation
+happens at the daemon (list every dir you personally want visible in your
+own `config_dirs` — that's a read-only view on your own device, not a merge
+of the underlying data):
+
+```ini
+config_dirs = ~/.claude, ~/.claude-clientA, ~/.claude-clientB
+```
+
+Running `claude` directly (no container) against a specific dir works the
+same way, just simpler — no mount needed:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-clientA claude
+```
+
 ## Notes
 
 - **Privacy/security.** Hook payloads contain prompt and response text, so the

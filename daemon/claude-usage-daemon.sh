@@ -8,6 +8,86 @@
 # if this daemon isn't running to ship it. See daemon/SESSIONS.md.
 # Dependencies: curl, awk, bluetoothctl, python3 (sidecar only)
 
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    cat <<'EOF'
+Claude Usage Tracker Daemon (BLE)
+
+Reads your Claude Code OAuth token, polls Anthropic for usage, and ships it
+to the Clawdmeter ESP32 over BLE GATT. Also supervises the optional
+session-awareness sidecar (clawdmeter_sessions.py) as a child process
+when hook_port is configured — see daemon/SESSIONS.md for the full design.
+
+Usage: claude-usage-daemon.sh [-h|--help]
+
+No other flags — this runs as a long-lived daemon (systemd unit
+claude-usage-daemon, installed by ./install.sh) or directly in a terminal.
+
+Environment:
+  DEVICE_MAC    Skip BLE discovery and connect to this MAC directly.
+
+Config file: ~/.config/claude-usage-monitor/config ("key = value" per line,
+"#" starts a trailing comment). Recognized keys:
+
+  config_dirs           Comma-separated Claude config dirs to poll/watch.
+                         Default: ~/.claude. Supports "~" and "~/...".
+                         Multiple dirs let one device show several
+                         accounts/projects at once WITHOUT merging their
+                         data — each dir keeps its own separate credentials,
+                         rosters, and transcripts; only this daemon's own
+                         read-only view aggregates them. Useful for
+                         per-project isolation with Claude Code in Docker:
+                         give each project its own dir (e.g. ~/.claude-work),
+                         mount only that one into that project's container,
+                         and list every dir you want visible on the device
+                         here. See "Docker / devcontainer sessions" below.
+
+  hook_port              Loopback port for the session-awareness sidecar's
+                         HTTP hook listener. Unset (default) = feature off:
+                         the sidecar never starts, the device shows no
+                         session data. Set by ./install.sh's prompt, or by
+                         hand — see daemon/SESSIONS.md's setup steps (you
+                         also need the matching hook block in each config
+                         dir's settings.json).
+
+  sessions_budget_bytes  Byte budget for the session-view wire payload
+                         (sidecar-only setting). Default: 400. Labels
+                         truncate toward an 8-char floor first, then
+                         least-urgent rows drop, once a payload exceeds
+                         this; raise it if you regularly run enough
+                         concurrent sessions that names still feel
+                         squeezed. Keep it under the ~514-byte ceiling of
+                         the firmware's negotiated 517-byte BLE MTU.
+
+  context_window_k       Pin the context-window-% heuristic to this many
+                         kilotokens (sidecar-only setting) instead of the
+                         200k/1M auto-detect. Usually leave unset.
+
+  clock                  off (default) / auto / 12 / 24 — show a live
+                         clock instead of the "Usage" title.
+
+  chime                  on / off (default) — play the session-reset
+                         chime through the board speaker (boards with one).
+
+Docker / devcontainer sessions:
+  Claude Code running inside a container needs three things to show up
+  here, none of which require any code change — see daemon/SESSIONS.md:
+    1. Hook connectivity: run the container with --network=host so its
+       127.0.0.1 IS the host's 127.0.0.1 (hooks POST to a loopback URL).
+    2. Correct liveness: run with --pid=host so the sidecar's pid_alive()
+       (a plain /proc/<pid>/stat check) sees the container's processes
+       under their real host PIDs instead of a container-local number
+       that means nothing on the host.
+    3. Visible config: bind-mount a Claude config dir into the container
+       at its normal ~/.claude path, and list that dir (from the HOST'S
+       path to it) in config_dirs above. Use a DEDICATED dir per project
+       if you don't want different projects' sessions/credentials sharing
+       state with each other — never bind-mount the same dir into
+       containers you want isolated from one another.
+  Both flags are Linux-only Docker features.
+EOF
+    exit 0
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SESSIONS_BIN="$SCRIPT_DIR/clawdmeter_sessions.py"
 SESSIONS_PID=""
