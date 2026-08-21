@@ -646,6 +646,7 @@ static uint8_t  s_live_count    = 0;      // rows in the last received list
 static bool     s_any_waiting   = false;  // any row in the waiting bucket
 static bool     s_any_active    = false;  // any row not idle (working or waiting)
 static bool     s_focus_waiting = false;  // rows[0] waiting → status line hides
+static bool     s_focus_active  = false;  // rows[0] not idle → status line shows
 static bool     s_chats_linger  = false;  // holding a chat view after the last chat closed
 static uint32_t s_chats_gone_ms = 0;
 static int      s_linger_view   = 2;
@@ -1127,6 +1128,7 @@ static void focus_set_content(const SessionRow* r) {
 
     chat_card_set_row(&focus_card, r);
     s_focus_waiting = focus_card.waiting;
+    s_focus_active = (session_bucket(r->state) != SESSION_BUCKET_IDLE);
 
     // Context row: percentage (spelled out — it doubles as onboarding for
     // the terse multi-chat bars) on the left, token counter on the right.
@@ -1684,22 +1686,23 @@ void ui_update(const UsageData* data) {
 // (every chat closed or idle, or a chat's own pulsing indicator already has
 // your attention).
 //
-// On SEVERAL-CHATS this is keyed off s_any_active (any row not idle) rather
-// than the single-session view's s_focus_waiting, because "is anyone doing
-// anything" is exactly the question this line answers there — showing it
-// over an all-idle list read as false liveliness. A near-identical
-// bucket-driven version was blamed for a "whole screen flickering" report
-// once before and reverted to s_any_waiting-only; root cause was never
-// conclusively pinned down (several other things changed the same session),
-// and the daemon's own state machine holds RUNNING_TOOL steady between a
-// turn's tool calls rather than dipping through IDLE, so it shouldn't
-// actually flap. Watch for a recurrence before assuming this is settled.
+// Keyed off s_any_active/s_focus_active (any row / the one row not idle)
+// rather than only s_any_waiting/s_focus_waiting, because "is anyone doing
+// anything" is exactly the question this line answers here — showing it
+// over an idle chat (or an all-idle list) read as false liveliness. A
+// near-identical bucket-driven version was blamed for a "whole screen
+// flickering" report once before and reverted to waiting-only; root cause
+// was never conclusively pinned down (several other things changed the same
+// session), and the daemon's own state machine holds RUNNING_TOOL steady
+// between a turn's tool calls rather than dipping through IDLE, so it
+// shouldn't actually flap. Watch for a recurrence before assuming this is
+// settled.
 static void apply_anim_visibility(void) {
     if (!lbl_anim) return;
     bool hide = false;
 #if BOARD_HAS_SESSION_VIEWS
     if (view_state == 4) hide = (s_live_count == 0) || s_any_waiting || !s_any_active;
-    else if (view_state == 3) hide = (s_live_count == 0) || s_focus_waiting;
+    else if (view_state == 3) hide = (s_live_count == 0) || s_focus_waiting || !s_focus_active;
 #endif
     if (hide) lv_obj_add_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
     else      lv_obj_clear_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
@@ -1935,6 +1938,7 @@ void ui_update_sessions(const SessionList* list) {
             s_chats_gone_ms = lv_tick_get();
             s_linger_view = view_state;
             s_focus_waiting = false;
+            s_focus_active = false;
             if (focus_card.dot) {
                 lv_obj_set_style_bg_opa(focus_card.dot, LV_OPA_COVER, 0);
                 lv_obj_set_style_text_opa(focus_card.lbl_state, LV_OPA_COVER, 0);
