@@ -121,6 +121,10 @@ Check status: `systemctl --user status claude-usage-daemon`
 
 View logs: `journalctl --user -u claude-usage-daemon -f`
 
+On a machine without this repo cloned, a flashed device can hand you
+`install.sh` directly over the serial connection instead — see
+[`daemon/BOOTSTRAP.md`](daemon/BOOTSTRAP.md).
+
 ## Windows installation
 
 Runs natively on Windows — no WSL required. A system-tray app polls your usage and pushes it over BLE, and starts automatically at login.

@@ -3,6 +3,8 @@
 #include <lvgl.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
+#include <SPIFFS.h>
+#include <MD5Builder.h>
 
 #include "data.h"
 #include "ui.h"
@@ -214,13 +216,68 @@ static void send_screenshot() {
 #endif
 }
 
+// Serves /setup.sh out of the SPIFFS partition (flashed separately via
+// `pio run -t uploadfs` — see tools/build_setup_bundle.sh) as raw bytes
+// over serial: a self-extracting shell script (tools/setup_stub.sh header +
+// an appended tar.gz — see that file) that unpacks and runs install.sh once
+// downloaded. Lets a machine with nothing but a serial connection bootstrap
+// the daemon straight from an already-flashed device — see
+// daemon/BOOTSTRAP.md. Same START/raw-payload/END shape as
+// send_screenshot() above. Streamed in fixed chunks rather than read into
+// one malloc'd buffer, so this doesn't need a bundle-sized contiguous heap
+// allocation. SPIFFS.begin(false) deliberately never formats: the
+// partition arrives pre-populated by uploadfs, and auto-formatting on a
+// mount hiccup would silently destroy that image instead of just failing
+// loudly.
+//
+// The header carries an MD5 of the payload — measured on real hardware:
+// this cheap CH340-over-USB link has no flow control, and under bash's
+// byte-at-a-time reads a chunk of the stream can go missing silently. The
+// receiver's read still ends up exactly `size` bytes long (whatever tool
+// reads it just keeps consuming into the following SETUP_END marker to
+// make up the shortfall), so a plain length check can't catch this — only
+// a content hash can. Host side must verify and retry; see the bundled
+// bootstrap script.
+static void send_setup_bundle() {
+    if (!SPIFFS.begin(false)) {
+        Serial.println("SETUP_UNSUPPORTED");
+        return;
+    }
+    File f = SPIFFS.open("/setup.sh", "r");
+    if (!f) {
+        Serial.println("SETUP_UNSUPPORTED");
+        return;
+    }
+    const size_t size = f.size();
+
+    MD5Builder md5;
+    md5.begin();
+    md5.addStream(f, size);
+    md5.calculate();
+    const String hex = md5.toString();
+    f.seek(0);   // rewind — addStream() consumed the file computing the hash
+
+    Serial.printf("SETUP_START %u %s\n", (unsigned)size, hex.c_str());
+    Serial.flush();
+    uint8_t buf[512];
+    size_t chunk;
+    while ((chunk = f.read(buf, sizeof(buf))) > 0) {
+        Serial.write(buf, chunk);
+    }
+    f.close();
+    Serial.flush();
+    Serial.println();
+    Serial.println("SETUP_END");
+}
+
 static void check_serial_cmd() {
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
-            if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
-            else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
+            if (strcmp(cmd_buf, "screenshot") == 0)  send_screenshot();
+            else if (strcmp(cmd_buf, "buzz") == 0)   sound_hal_play_reset();
+            else if (strcmp(cmd_buf, "get-setup") == 0) send_setup_bundle();
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
