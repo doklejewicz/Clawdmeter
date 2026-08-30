@@ -41,12 +41,30 @@ static UsageData usage = {};
 static uint16_t* buf1 = nullptr;
 static uint16_t* buf2 = nullptr;
 
+#ifndef BOARD_HAS_PSRAM
+// Set only while send_screenshot() is streaming a capture — see there for
+// why this piggybacks on the normal partial-render flush instead of a
+// one-shot lv_snapshot buffer. g_screenshot_bytes_sent lets send_screenshot()
+// know when every row has actually gone out over Serial, since one
+// lv_timer_handler() call only dispatches a bounded slice of the draw work
+// (same as normal loop() operation) — it takes several calls to flush a
+// dirty area taller than one BUF_LINES-high buffer.
+static volatile bool g_screenshot_streaming = false;
+static volatile uint32_t g_screenshot_bytes_sent = 0;
+#endif
+
 static uint32_t my_tick(void) { return millis(); }
 
 static void my_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
     int32_t w = area->x2 - area->x1 + 1;
     int32_t h = area->y2 - area->y1 + 1;
     display_hal_draw_bitmap(area->x1, area->y1, w, h, (uint16_t*)px_map);
+#ifndef BOARD_HAS_PSRAM
+    if (g_screenshot_streaming) {
+        Serial.write(px_map, (size_t)w * (size_t)h * 2);
+        g_screenshot_bytes_sent += (uint32_t)w * (uint32_t)h * 2;
+    }
+#endif
     lv_display_flush_ready(disp);
 }
 
@@ -205,9 +223,47 @@ static bool serial_usage_screen_shown = false;
 
 static void send_screenshot() {
 #ifndef BOARD_HAS_PSRAM
-    // A full RGB565 framebuffer doesn't fit in internal SRAM on PSRAM-free
-    // boards (e.g. 480×480×2 = 460 KB). Capture is unsupported there.
-    Serial.println("SCREENSHOT_UNSUPPORTED");
+    // A full RGB565 framebuffer doesn't fit in one contiguous internal-SRAM
+    // allocation on PSRAM-free boards (e.g. CYD 320×240×2 = 150 KB), so
+    // lv_snapshot_take_to_draw_buf() (which needs exactly that) is out.
+    // Instead: force a full redraw of the active screen and tee each
+    // already-allocated BUF_LINES-tall flush chunk (my_flush_cb above) out
+    // over Serial as it's produced. LVGL always tiles a single full-screen
+    // dirty rect top-to-bottom, full-width, gap-free in partial-render
+    // mode, so the concatenated chunks land in the exact same row-major
+    // layout as the PSRAM path's single buf_size buffer below — the host
+    // side (screenshot.sh) can't tell the two apart on the wire. One
+    // lv_timer_handler() call only dispatches a bounded slice of the redraw
+    // (same as normal loop() operation), so this pumps it repeatedly until
+    // every row has actually gone out (g_screenshot_bytes_sent, updated
+    // from my_flush_cb), not just once.
+    const uint32_t w = board_caps().width;
+    const uint32_t h = board_caps().height;
+    const uint32_t buf_size = w * h * 2;
+
+    Serial.printf("SCREENSHOT_START %lu %lu %lu\n",
+        (unsigned long)w, (unsigned long)h, (unsigned long)buf_size);
+    Serial.flush();
+
+    g_screenshot_streaming = true;
+    g_screenshot_bytes_sent = 0;
+    lv_obj_invalidate(lv_screen_active());
+    // The pixel data itself is the slow part — at 115200 baud a full frame
+    // takes several seconds on the wire alone (buf_size/6000 B/s, well
+    // under the nominal 11.5 KB/s, to leave headroom for render compute
+    // between chunks), plus fixed slack for that compute. A short fixed
+    // cap here truncated the stream partway on real hardware (CYD, first
+    // try: only ~2/3 of the frame arrived before this loop gave up).
+    const uint32_t deadline_ms = 5000 + buf_size / 6;
+    const uint32_t start_ms = millis();
+    while (g_screenshot_bytes_sent < buf_size && millis() - start_ms < deadline_ms) {
+        lv_timer_handler();
+    }
+    g_screenshot_streaming = false;
+
+    Serial.flush();
+    Serial.println();
+    Serial.println("SCREENSHOT_END");
     return;
 #else
     const uint32_t w = board_caps().width;
