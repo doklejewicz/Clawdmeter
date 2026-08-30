@@ -14,6 +14,15 @@
 // The raw ADC bounds below aren't a factory calibration — they self-widen on
 // out-of-range reads, same as the verified build, so accuracy improves after
 // the first few taps near the panel edges.
+//
+// touch_hal_read() maps the ADC range to the INVERTED display range (see the
+// map() calls below) — confirmed empirically (a 4-corner tap test) that this
+// board's touch axes land exactly 180° opposite the display's without it:
+// every physical corner tap was reported as its diagonal opposite. Harmless
+// for "tap anywhere" gestures (the whole panel was one big hit target,
+// which is presumably why this was never caught before), but broke any
+// feature needing a specific screen region (e.g. the Settings-screen tap
+// zone) until this was found and fixed.
 
 static SPIClass touch_spi(VSPI);
 static XPT2046_Touchscreen touchscreen(TP_CS, TP_IRQ);
@@ -38,8 +47,8 @@ void touch_hal_read(uint16_t* x, uint16_t* y, bool* pressed) {
         if (p.x > cal_max_x) cal_max_x = p.x;
         if (p.y < cal_min_y) cal_min_y = p.y;
         if (p.y > cal_max_y) cal_max_y = p.y;
-        touch_x = map(p.x, cal_min_x, cal_max_x, 1, LCD_WIDTH);
-        touch_y = map(p.y, cal_min_y, cal_max_y, 1, LCD_HEIGHT);
+        touch_x = map(p.x, cal_min_x, cal_max_x, LCD_WIDTH, 1);
+        touch_y = map(p.y, cal_min_y, cal_max_y, LCD_HEIGHT, 1);
         touch_pressed = true;
     } else {
         touch_pressed = false;
