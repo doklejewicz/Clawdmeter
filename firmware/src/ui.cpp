@@ -1671,6 +1671,10 @@ static void transport_cycle_cb(lv_event_t* e) {
     transport_pref_t t = (transport_pref_t)((settings_get_transport() + 1) % TRANSPORT_COUNT);
     settings_set_transport(t);
     lv_label_set_text(lbl_transport_value, settings_transport_name(t));
+    // USB-only turns the BLE radio off outright (also silences the HID
+    // keyboard shortcuts, which ride the same connection — accepted
+    // tradeoff). Auto/BLE keep it on.
+    ble_set_enabled(t != TRANSPORT_USB);
 }
 
 static void clockfmt_cycle_cb(lv_event_t* e) {

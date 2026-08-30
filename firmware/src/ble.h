@@ -10,6 +10,14 @@ enum ble_state_t {
 
 void ble_init(void);
 void ble_tick(void);
+// Stops/resumes advertising — used to honor the Settings screen's transport
+// preference (USB-only turns the radio off; this also silences the HID
+// keyboard shortcuts, since they ride the same BLE connection). Existing
+// connections aren't force-dropped, only new ones are prevented; disabling
+// just stops advertising rather than tearing down NimBLE entirely, so
+// re-enabling is instant. Safe to call redundantly (no-ops if already in
+// the requested state).
+void ble_set_enabled(bool enabled);
 ble_state_t ble_get_state(void);
 const char* ble_get_device_name(void);
 const char* ble_get_mac_address(void);

@@ -384,7 +384,14 @@ static void check_serial_cmd() {
                 // {"ss":...}-only line would otherwise "succeed" there too and
                 // zero out the real usage display.
 #if BOARD_HAS_SESSION_VIEWS
-                if (parse_sessions(cmd_buf, &sessions)) {
+                if (settings_get_transport() == TRANSPORT_BLE) {
+                    // User selected BLE-only — still ack so the daemon's
+                    // serial link stays healthy (a nack/timeout here reads
+                    // to it as a dead connection and triggers a reconnect
+                    // loop), but ignore the data itself, same as if this
+                    // transport weren't connected at all.
+                    Serial.println("{\"ack\":true}");
+                } else if (parse_sessions(cmd_buf, &sessions)) {
                     idle_note_activity();
                     ui_update_sessions(&sessions);
                     Serial.println("{\"ack\":true}");
@@ -395,7 +402,9 @@ static void check_serial_cmd() {
                 Serial.println("{\"ack\":false}");
 #endif
             } else if (cmd_buf[0] == '{') {
-                if (apply_usage_json(cmd_buf)) {
+                if (settings_get_transport() == TRANSPORT_BLE) {
+                    Serial.println("{\"ack\":true}");
+                } else if (apply_usage_json(cmd_buf)) {
                     ui_note_serial_activity();
                     if (!serial_usage_screen_shown) {
                         ui_show_screen(SCREEN_USAGE);
@@ -459,6 +468,10 @@ void setup() {
     lv_indev_set_read_cb(indev, my_touch_cb);
 
     ble_init();
+    // Apply the persisted Settings-screen transport preference — ble_init()
+    // above always starts advertising unconditionally, so a saved
+    // USB-only choice needs to turn it back off immediately at boot.
+    ble_set_enabled(settings_get_transport() != TRANSPORT_USB);
     input_hal_init();
 
     ui_init();
@@ -615,7 +628,12 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        if (apply_usage_json(ble_get_data())) {
+        if (settings_get_transport() == TRANSPORT_USB) {
+            // User selected USB-only — ack so the host doesn't think the
+            // write failed, but ignore the data itself, same as if this
+            // transport weren't connected at all.
+            ble_send_ack();
+        } else if (apply_usage_json(ble_get_data())) {
             ble_send_ack();
         } else {
             ble_send_nack();
@@ -624,13 +642,14 @@ void loop() {
 
 #if BOARD_HAS_SESSION_VIEWS
     if (ble_has_session_data()) {
-        if (parse_sessions(ble_get_session_data(), &sessions)) {
+        if (settings_get_transport() != TRANSPORT_USB && parse_sessions(ble_get_session_data(), &sessions)) {
             // Claude counts as activity (§2.4): a session state change wakes
             // a sleeping panel and resets the sleep timer.
             idle_note_activity();
             ui_update_sessions(&sessions);
         }
-        // Malformed payload → ignored; the last good list stays on screen.
+        // Malformed payload, or ignored due to transport preference →
+        // the last good list stays on screen.
     }
 #endif
 

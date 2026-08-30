@@ -70,6 +70,7 @@ static NimBLECharacteristic* ss_char = nullptr;
 
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
+static bool ble_enabled = true;   // Settings-screen transport preference — see ble_set_enabled()
 
 // One-shot supervision-timeout pushback (see onConnParamsUpdate). Written by
 // NimBLE host-task callbacks, consumed by ble_tick() on the loop task.
@@ -155,6 +156,10 @@ static void claim_owner(const std::string& id) {
 }
 
 static void start_advertising() {
+    // Every caller (ble_init(), ble_tick()'s need_advertise, ble_clear_bonds())
+    // goes through here, so gating it in one place is enough to honor the
+    // Settings-screen transport preference everywhere.
+    if (!ble_enabled) return;
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->reset();
     // Primary advertising packet (≤31 bytes):
@@ -404,6 +409,22 @@ void ble_init(void) {
     start_advertising();
 
     Serial.printf("BLE: init complete, MAC=%s\n", mac_str);
+}
+
+void ble_set_enabled(bool enabled) {
+    if (ble_enabled == enabled) return;
+    ble_enabled = enabled;
+    if (enabled) {
+        start_advertising();
+    } else {
+        NimBLEDevice::getAdvertising()->stop();
+        // Doesn't force-drop an already-connected peer (see ble.h) — only
+        // reflect "off" in the UI state if nothing's actually connected.
+        if (!server || server->getConnectedCount() == 0) {
+            state = BLE_STATE_DISCONNECTED;
+        }
+    }
+    Serial.printf("BLE: %s (Settings transport preference)\n", enabled ? "enabled" : "disabled");
 }
 
 void ble_tick(void) {

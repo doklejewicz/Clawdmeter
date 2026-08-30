@@ -91,6 +91,12 @@ void ble_init(void) {
     refresh_title();
 }
 
+void ble_set_enabled(bool enabled) {
+    // No real radio to toggle in the simulator — playback is driven by the
+    // scenario file regardless of the Settings-screen transport preference.
+    (void)enabled;
+}
+
 void ble_tick(void) {
     if (!connected || pending || !playing || n_states == 0) return;
     if (millis() - delivered_ms >= states[cur].hold_ms) {
