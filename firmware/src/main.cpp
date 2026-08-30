@@ -195,7 +195,10 @@ static bool apply_usage_json(const char* json) {
 }
 
 // ---- Serial command buffer ----
-#define CMD_BUF_SIZE 384
+// 640, not the ~400 default sessions_budget_bytes, to leave headroom for
+// installs that raise that budget (see claude-usage-daemon.sh --help) — a
+// truncated session line would otherwise fail parse_sessions() silently.
+#define CMD_BUF_SIZE 640
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 static bool serial_usage_screen_shown = false;
@@ -316,8 +319,27 @@ static void check_serial_cmd() {
             } else if (strcmp(cmd_buf, "identify") == 0) {
                 Serial.printf("{\"device\":\"Clawdmeter\",\"board\":\"%s\"}\n",
                               board_caps().name);
+            } else if (cmd_buf[0] == '{' && strstr(cmd_buf, "\"ss\":") != nullptr) {
+                // Session-list payload — same shape as the BLE SS characteristic
+                // (see parse_sessions() above), just line-delimited instead of a
+                // separate GATT characteristic. Checked before the generic usage
+                // branch below: parse_json()'s fields are all optional, so an
+                // {"ss":...}-only line would otherwise "succeed" there too and
+                // zero out the real usage display.
+#if BOARD_HAS_SESSION_VIEWS
+                if (parse_sessions(cmd_buf, &sessions)) {
+                    idle_note_activity();
+                    ui_update_sessions(&sessions);
+                    Serial.println("{\"ack\":true}");
+                } else {
+                    Serial.println("{\"ack\":false}");
+                }
+#else
+                Serial.println("{\"ack\":false}");
+#endif
             } else if (cmd_buf[0] == '{') {
                 if (apply_usage_json(cmd_buf)) {
+                    ui_note_serial_activity();
                     if (!serial_usage_screen_shown) {
                         ui_show_screen(SCREEN_USAGE);
                         serial_usage_screen_shown = true;
