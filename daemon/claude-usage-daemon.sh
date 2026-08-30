@@ -1,21 +1,32 @@
 #!/bin/bash
-# Claude Usage Tracker Daemon (BLE)
-# Reads Claude Code OAuth token, polls usage via API, sends to ESP32 over BLE GATT.
-# Auto-connects and reconnects to the Clawdmeter BLE device.
+# Claude Usage Tracker Daemon (BLE or USB serial)
+# Reads Claude Code OAuth token, polls usage via API, sends it to the ESP32
+# over whichever transport is available: a physical USB-to-UART bridge such
+# as CH340 if the board is plugged in and answers `identify` (no BLE pairing
+# needed at all), falling back to BLE GATT otherwise. Both transports share
+# the same payload-building code; only the last-mile send differs, and every
+# reconnect cycle re-checks for serial first, so plugging the board in while
+# it's running on BLE switches it over on the next cycle.
 # Also supervises the optional session-awareness sidecar (clawdmeter_sessions.py,
 # issue #135) as a child process when hook_port is configured — one process to
-# start/stop/systemd-manage, since shipping session data over BLE is pointless
-# if this daemon isn't running to ship it. See daemon/SESSIONS.md.
-# Dependencies: curl, awk, bluetoothctl, python3 (sidecar only)
+# start/stop/systemd-manage, since shipping session data is pointless if this
+# daemon isn't running to ship it. Live sessions ship over both transports —
+# the BLE SS characteristic or a plain serial line, whichever is active.
+# See daemon/SESSIONS.md.
+# Dependencies: curl, awk, bluetoothctl (BLE fallback only), python3 (sidecar only)
 
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     cat <<'EOF'
-Claude Usage Tracker Daemon (BLE)
+Claude Usage Tracker Daemon (BLE or USB serial)
 
 Reads your Claude Code OAuth token, polls Anthropic for usage, and ships it
-to the Clawdmeter ESP32 over BLE GATT. Also supervises the optional
-session-awareness sidecar (clawdmeter_sessions.py) as a child process
-when hook_port is configured — see daemon/SESSIONS.md for the full design.
+to the Clawdmeter ESP32 over whichever transport is available. USB serial
+(any CH340-class USB-UART bridge) is tried first and needs no BLE pairing
+at all — just the board plugged in; BLE GATT is the fallback when no
+serial port answers. Also supervises the optional session-awareness
+sidecar (clawdmeter_sessions.py) as a child process when hook_port is
+configured — see daemon/SESSIONS.md for the full design. Live session
+views work over either transport.
 
 Usage: claude-usage-daemon.sh [-h|--help]
 
@@ -23,10 +34,18 @@ No other flags — this runs as a long-lived daemon (systemd unit
 claude-usage-daemon, installed by ./install.sh) or directly in a terminal.
 
 Environment:
-  DEVICE_MAC    Skip BLE discovery and connect to this MAC directly.
+  DEVICE_MAC    Skip BLE discovery and connect to this MAC directly
+                (only used when falling back to BLE).
 
 Config file: ~/.config/claude-usage-monitor/config ("key = value" per line,
 "#" starts a trailing comment). Recognized keys:
+
+  serial_port            Explicit device path (e.g. /dev/ttyUSB0) to use
+                         for the USB serial transport instead of
+                         auto-detecting. Unset (default) = probe every
+                         /dev/ttyUSB*/ttyACM* with the firmware's
+                         `identify` command and use whichever one answers
+                         as a Clawdmeter.
 
   config_dirs           Comma-separated Claude config dirs to poll/watch.
                          Default: ~/.claude. Supports "~" and "~/...".
@@ -157,7 +176,8 @@ stop_sessions_sidecar() {
 # personal plan and ~/.claude-work for a work plan, selected via
 # CLAUDE_CONFIG_DIR). The daemon polls each configured dir's token every cycle
 # and shows whichever plan is "active" (the one whose usage moved most recently
-# — see poll()). Per-dir state persists across poll() calls for that decision.
+# — see build_active_payload()). Per-dir state persists across calls for
+# that decision.
 declare -A PREV_S       # last session % seen per dir (detects a rise = activity)
 declare -A LAST_ACTIVE  # poll-sequence number of the last observed rise (0 = never)
 POLL_SEQ=0              # monotonic poll counter — recency ordering that's immune to
@@ -476,15 +496,104 @@ write_gatt_bytes() {
         WriteValue "aya{sv}" "$count" $bytes 0 2>/dev/null
 }
 
+# --- USB serial transport ---------------------------------------------------
+# The alternative to BLE: the firmware also accepts the same usage JSON (and,
+# separately, session-list JSON — see maybe_send_sessions_serial() below) one
+# line at a time over its USB-UART bridge (see check_serial_cmd() in
+# main.cpp) and answers identify/each payload with a line of its own, so no
+# BLE pairing is needed at all. Both transports listen unconditionally on
+# the device — this only decides which one *this daemon* uses.
+SERIAL_ACK_TIMEOUT=3
+
+# Open $1 at the firmware's fixed baud rate on fd 9, raw mode, no echo.
+# Every serial helper below opens-writes-reads-closes per call rather than
+# holding the fd open across polls — polls are 60s apart, so the repeated
+# open cost is irrelevant, and a fresh open avoids ever reading stale bytes
+# left over from a previous exchange (see tools/get_setup.sh's drain gotcha).
+_open_serial() {
+    local dev="$1"
+    [ -c "$dev" ] || return 1
+    stty -F "$dev" 115200 raw -echo 2>/dev/null || return 1
+    exec 9<>"$dev" 2>/dev/null || return 1
+}
+
+_close_serial() {
+    exec 9<&- 2>/dev/null
+}
+
+# Send $2 (a bare command or a JSON payload line) to $1 and scan replies for
+# $3 (a literal substring, e.g. '"device":"Clawdmeter"' or '"ack":true') for
+# up to $SERIAL_ACK_TIMEOUT seconds. Other lines (boot logs, view_state
+# debug prints — this is the same stream main.cpp's Serial.print debugging
+# uses) are skipped rather than assumed to be the answer, same rationale as
+# tools/get_setup.sh scanning for SETUP_START instead of trusting line 1.
+_serial_roundtrip() {
+    local dev="$1" line="$2" want="$3"
+    _open_serial "$dev" || return 1
+    printf '%s\n' "$line" >&9
+    local deadline=$((SECONDS + SERIAL_ACK_TIMEOUT)) reply found=1
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        IFS= read -r -t 1 -u 9 reply || continue
+        case "$reply" in
+            *"$want"*) found=0; break ;;
+        esac
+    done
+    _close_serial
+    return $found
+}
+
+# Auto-detect the Clawdmeter's serial port: an explicit `serial_port` config
+# override, or every /dev/ttyUSB*/ttyACM* probed with `identify` until one
+# answers as a Clawdmeter (mirrors the Windows serial daemon's
+# candidate_serial_ports() + is_clawdmeter_identity()). No Bluetooth-port
+# filtering needed here — unlike Windows COM ports, BlueZ doesn't expose
+# bonded devices as ttyUSB/ttyACM nodes.
+find_serial_port() {
+    local override
+    override=$(read_config_value serial_port)
+    if [ -n "$override" ]; then
+        _serial_roundtrip "$override" "identify" '"device":"Clawdmeter"' && echo "$override"
+        return
+    fi
+    local dev
+    for dev in /dev/ttyUSB* /dev/ttyACM*; do
+        [ -e "$dev" ] || continue
+        if _serial_roundtrip "$dev" "identify" '"device":"Clawdmeter"'; then
+            echo "$dev"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Send one usage payload over serial and wait for {"ack":true}.
+write_serial() {
+    local dev="$1" payload="$2"
+    _serial_roundtrip "$dev" "$payload" '"ack":true'
+}
+
 # --- Live session awareness (issue #135) -----------------------------------
 # The session sidecar (spawned above by start_sessions_sidecar(); see
 # SESSIONS.md) listens for Claude Code hook events and writes an
 # already-fitted wire payload to ~/.claude/clawdmeter-sessions.json on every
-# session state change. On the existing 5s tick, ship that payload to the SS
-# characteristic whenever the file's content changed. Fully inert when the
-# file doesn't exist (feature off / sidecar not running) and when the
-# firmware doesn't expose the characteristic (older firmware) — no errors,
-# no log spam.
+# session state change. On the existing 5s tick, ship that payload — over the
+# BLE SS characteristic or a plain serial line, whichever transport is active
+# (see maybe_send_sessions() / maybe_send_sessions_serial() below) — whenever
+# the file's content changed. Fully inert when the file doesn't exist
+# (feature off / sidecar not running) — no errors, no log spam.
+
+# sessions.json holds {"ts":..., "payload":"<wire string>"}. The payload is
+# stored as a string so the exact bytes the sidecar fitted to the budget are
+# what goes out, unchanged by either transport. Echoes it, or empty if the
+# file is missing/unparseable. Shared by both maybe_send_sessions functions.
+_read_sessions_payload() {
+    PYTHONIOENCODING=utf-8 python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1]))["payload"])
+except Exception:
+    pass' "$SESSIONS_FILE" 2>/dev/null
+}
+
 maybe_send_sessions() {
     [ -f "$SESSIONS_FILE" ] || return 0
     local sig
@@ -502,15 +611,8 @@ maybe_send_sessions() {
         fi
         log "GATT SS path: $SS_CHAR_PATH"
     fi
-    # sessions.json holds {"ts":..., "payload":"<wire string>"}. The payload is
-    # stored as a string so the exact bytes the sidecar fitted to the budget
-    # are what goes over the air.
     local payload
-    payload=$(PYTHONIOENCODING=utf-8 python3 -c 'import json,sys
-try:
-    print(json.load(open(sys.argv[1]))["payload"])
-except Exception:
-    pass' "$SESSIONS_FILE" 2>/dev/null)
+    payload=$(_read_sessions_payload)
     [ -z "$payload" ] && { LAST_SESSIONS_SIG="$sig"; return 0; }
     if write_gatt_bytes "$SS_CHAR_PATH" "$payload"; then
         LAST_SESSIONS_SIG="$sig"
@@ -518,9 +620,33 @@ except Exception:
     return 0
 }
 
+# Same idea over USB serial: the payload string already IS the full
+# {"ss":[...]}  JSON object (see clawdmeter_sessions.py), so it's sent as
+# just another line — check_serial_cmd() in main.cpp routes it away from the
+# usage-payload path by spotting the "ss" key before parsing. Boards without
+# BOARD_HAS_SESSION_VIEWS reply {"ack":false}, so write_serial fails there
+# and this quietly no-ops on the next changed payload, same as the BLE path
+# hitting a firmware without the SS characteristic.
+maybe_send_sessions_serial() {
+    local dev="$1"
+    [ -f "$SESSIONS_FILE" ] || return 0
+    local sig
+    sig=$(md5sum "$SESSIONS_FILE" 2>/dev/null | awk '{print $1}')
+    [ -z "$sig" ] && return 0
+    [ "$sig" = "$LAST_SESSIONS_SIG" ] && return 0
+    local payload
+    payload=$(_read_sessions_payload)
+    [ -z "$payload" ] && { LAST_SESSIONS_SIG="$sig"; return 0; }
+    if write_serial "$dev" "$payload"; then
+        LAST_SESSIONS_SIG="$sig"
+    fi
+    return 0
+}
+
 # Build the device payload for one OAuth token. Echoes the JSON payload on
-# success (empty + non-zero return on failure). Pure: no logging, no GATT write
-# — poll() owns picking the active plan and sending it.
+# success (empty + non-zero return on failure). Pure: no logging, no send —
+# build_active_payload() owns picking the active plan, and the caller (a
+# transport loop) owns actually sending it.
 build_payload_for_token() {
     local token="$1"
     [ -z "$token" ] && return 1
@@ -630,12 +756,15 @@ _payload_session_pct() {
     echo "$1" | grep -o '"s":[0-9]*' | head -1 | cut -d: -f2
 }
 
-# Poll every configured config dir, decide which plan is "active", and send
-# that plan's payload. "Active" = the plan whose session % rose most recently
-# (recent API activity); a rise stamps LAST_ACTIVE so the choice is sticky and
-# survives window resets (a drop to 0 isn't activity). Before any rise is seen
+# Poll every configured config dir and decide which plan is "active" —
+# shared by both transports, which differ only in how they send the result.
+# "Active" = the plan whose session % rose most recently (recent API
+# activity); a rise stamps LAST_ACTIVE so the choice is sticky and survives
+# window resets (a drop to 0 isn't activity). Before any rise is seen
 # (startup), fall back to the plan with the highest current session %.
-poll() {
+# Echoes the chosen payload on success; empty + non-zero return if no
+# config dir yielded one this cycle.
+build_active_payload() {
     POLL_SEQ=$((POLL_SEQ + 1))
 
     local -a dirs
@@ -680,8 +809,16 @@ poll() {
     if [ ${#dirs[@]} -gt 1 ]; then
         log "Active plan: $best_dir (s=$best_s)"
     fi
-    log "Sending: ${cycle_payload[$best_dir]}"
-    write_gatt "$RX_CHAR_PATH" "${cycle_payload[$best_dir]}" || { log "Write failed"; return 1; }
+    printf '%s' "${cycle_payload[$best_dir]}"
+    return 0
+}
+
+# Poll and send over BLE — thin wrapper kept for the BLE loop's call site.
+poll_ble() {
+    local payload
+    payload=$(build_active_payload) || return 1
+    log "Sending: $payload"
+    write_gatt "$RX_CHAR_PATH" "$payload" || { log "Write failed"; return 1; }
     return 0
 }
 
@@ -694,7 +831,7 @@ cleanup() {
 
 trap cleanup INT TERM
 
-log "=== Claude Usage Tracker Daemon (BLE) ==="
+log "=== Claude Usage Tracker Daemon (BLE or USB serial) ==="
 log "Poll interval: ${POLL_INTERVAL}s"
 
 start_sessions_sidecar
@@ -702,12 +839,47 @@ start_sessions_sidecar
 BACKOFF=1
 
 while true; do
+    # Prefer USB serial: no BLE pairing needed, and this runs at the top of
+    # every reconnect cycle, so plugging the board in while running on BLE
+    # picks it up the next time this loop comes back around (worst case,
+    # one poll cycle later — see the mid-session check below).
+    SERIAL_PORT=$(find_serial_port)
+    if [ -n "$SERIAL_PORT" ]; then
+        log "Clawdmeter found on $SERIAL_PORT (USB serial)"
+        BACKOFF=1
+        LAST_POLL=0
+        LAST_SESSIONS_SIG=""  # resend current sessions to this freshly-seen device
+        while [ -e "$SERIAL_PORT" ]; do
+            NOW=$(date +%s)
+            if (( NOW - LAST_POLL >= POLL_INTERVAL )); then
+                payload=$(build_active_payload) && {
+                    log "Sending via serial: $payload"
+                    if write_serial "$SERIAL_PORT" "$payload"; then
+                        LAST_POLL=$NOW
+                    else
+                        log "Serial write failed, reconnecting..."
+                        break
+                    fi
+                }
+            fi
+            # No refresh-request equivalent on this transport (see
+            # check_serial_cmd() in main.cpp) — plain interval polling.
+            maybe_send_sessions_serial "$SERIAL_PORT"
+            start_sessions_sidecar   # no-op if already running; respawns if it crashed
+            sleep "$TICK"
+        done
+        log "Serial device gone, reconnecting..."
+        sleep 2
+        continue
+    fi
+
+    # --- BLE fallback ---------------------------------------------------
     # Find the device: only a device the system already knows (paired/connected).
     # We never scan by name, so we can't grab a stranger's or the wrong nearby
     # unit. Pair the device once first (it's a bonded BLE HID keyboard anyway).
     if ! load_mac; then
         find_system_device_mac || {
-            log "No paired/connected '$DEVICE_NAME'; waiting ${BACKOFF}s (not scanning)..."
+            log "No USB serial and no paired/connected '$DEVICE_NAME'; waiting ${BACKOFF}s (not scanning)..."
             sleep "$BACKOFF"
             BACKOFF=$((BACKOFF < 60 ? BACKOFF * 2 : 60))
             continue
@@ -748,11 +920,19 @@ while true; do
     while is_connected; do
         NOW=$(date +%s)
         if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
+            # Checked here (once per poll, not every $TICK) rather than in the
+            # inner loop's condition — find_serial_port() round-trips an
+            # `identify` to every candidate port, which isn't worth paying
+            # every 5s just to catch a cable being plugged in slightly sooner.
+            if [ -n "$(find_serial_port)" ]; then
+                log "USB serial now available, switching over"
+                break
+            fi
             if [ -f "$REFRESH_FLAG" ]; then
                 log "Refresh requested by device"
                 rm -f "$REFRESH_FLAG"
             fi
-            poll && LAST_POLL=$NOW
+            poll_ble && LAST_POLL=$NOW
         fi
         maybe_send_sessions
         start_sessions_sidecar   # no-op if already running; respawns if it crashed
