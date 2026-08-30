@@ -28,6 +28,12 @@ sidecar (clawdmeter_sessions.py) as a child process when hook_port is
 configured — see daemon/SESSIONS.md for the full design. Live session
 views work over either transport.
 
+While on USB serial, screenshot.sh doesn't open the port itself — it asks
+this daemon (the port's only owner) to capture a frame via a small
+request/response file handoff under ~/.config/claude-usage-monitor/, so
+there's never a second process contending for the port. No need to stop
+the daemon first to grab a screenshot.
+
 Usage: claude-usage-daemon.sh [-h|--help]
 
 No other flags — this runs as a long-lived daemon (systemd unit
@@ -123,6 +129,14 @@ POLL_INTERVAL=60
 TICK=5
 SAVED_MAC_FILE="$HOME/.config/claude-usage-monitor/ble-address"
 CONFIG_FILE="$HOME/.config/claude-usage-monitor/config"
+# screenshot.sh asks this daemon (the port's sole owner) to capture a
+# frame rather than opening the serial port itself — see
+# service_screenshot_request() below.
+SCREENSHOT_REQUEST_FILE="$HOME/.config/claude-usage-monitor/screenshot.request"
+SCREENSHOT_META_FILE="$HOME/.config/claude-usage-monitor/screenshot.response.meta"
+SCREENSHOT_RAW_FILE="$HOME/.config/claude-usage-monitor/screenshot.response.raw"
+SCREENSHOT_PROGRESS_FILE="$HOME/.config/claude-usage-monitor/screenshot.progress"
+SCREENSHOT_CAP_FILE="/tmp/claude-usage-screenshot-cap-$$"
 REFRESH_FLAG="/tmp/claude-usage-refresh-$$"
 DBUS_DEST="org.bluez"
 NOTIFY_PID=""
@@ -572,6 +586,126 @@ write_serial() {
     _serial_roundtrip "$dev" "$payload" '"ack":true'
 }
 
+# --- Screenshot proxy --------------------------------------------------------
+# screenshot.sh doesn't open the serial port itself while this daemon owns
+# it — it drops a token in $SCREENSHOT_REQUEST_FILE and polls
+# $SCREENSHOT_META_FILE for a matching line. Serviced here, inline, once per
+# loop tick (single bash process, no threading needed — this just makes one
+# tick take longer than usual).
+#
+# Writes "$1" to $SCREENSHOT_META_FILE via write-tmp-then-atomic-mv, so a
+# client polling that file never observes a half-written line.
+write_screenshot_meta() {
+    printf '%s\n' "$1" > "$SCREENSHOT_META_FILE.tmp" && mv -f "$SCREENSHOT_META_FILE.tmp" "$SCREENSHOT_META_FILE"
+}
+
+# Lets screenshot.sh render a real progress bar instead of a silent wait —
+# "$1 $2 $3" = token, bytes captured so far, total expected. Best-effort
+# only (no tmp+mv here — a torn read just means one skipped frame of a bar
+# that updates every 0.2s, self-corrects next tick, not worth the overhead).
+write_screenshot_progress() {
+    printf '%s %s %s\n' "$1" "$2" "$3" > "$SCREENSHOT_PROGRESS_FILE" 2>/dev/null
+}
+
+# If a screenshot request is pending, capture one frame from $1 (the
+# current serial port, or empty if not currently on serial) and answer it.
+# No-op if no request is waiting.
+#
+# Deliberately does NOT use _serial_roundtrip (line-based `read -r`, unsafe
+# for a binary payload containing embedded NULs/newline-like bytes).
+# Instead mirrors tools/get_setup.sh's proven technique: one continuous
+# backgrounded `cat` captures the whole stream (boot-log noise + header +
+# raw payload + trailer) into a file, and the header/payload are sliced out
+# by byte offset afterward. get_setup.sh's own comments explain why: a
+# split "read the header line, then fork a separate `head -c` for the
+# payload" approach leaves a fork/exec-sized gap where nothing drains the
+# kernel's tty buffer, which measurably corrupted transfers on this exact
+# hardware.
+service_screenshot_request() {
+    local dev="$1"
+    [ -e "$SCREENSHOT_REQUEST_FILE" ] || return 0
+    local token
+    token=$(cat "$SCREENSHOT_REQUEST_FILE")
+    rm -f "$SCREENSHOT_REQUEST_FILE"   # consume immediately — a slow capture spanning several ticks can't retrigger
+
+    if [ -z "$dev" ]; then
+        write_screenshot_meta "$token NOT_ON_SERIAL"
+        return 0
+    fi
+
+    log "Screenshot requested, capturing via $dev..."
+    _open_serial "$dev" || { write_screenshot_meta "$token TIMEOUT_HEADER"; return 0; }
+    : > "$SCREENSHOT_CAP_FILE"
+    cat <&9 > "$SCREENSHOT_CAP_FILE" &
+    local catpid=$!
+    printf 'screenshot\n' >&9
+
+    # Header: fixed short deadline, it's just a couple of text lines away
+    # regardless of board.
+    local deadline=$((SECONDS + 5)) offset=""
+    until [ -n "$offset" ]; do
+        offset=$(grep -abo 'SCREENSHOT_START\|SCREENSHOT_ERR\|SCREENSHOT_UNSUPPORTED' \
+            "$SCREENSHOT_CAP_FILE" 2>/dev/null | head -1 | cut -d: -f1)
+        if [ -z "$offset" ] && [ "$SECONDS" -ge "$deadline" ]; then
+            kill "$catpid" 2>/dev/null; wait "$catpid" 2>/dev/null
+            _close_serial
+            write_screenshot_meta "$token TIMEOUT_HEADER"
+            return 0
+        fi
+        [ -n "$offset" ] || sleep 0.1
+    done
+
+    local header_line hbytes
+    header_line=$(tail -c "+$((offset + 1))" "$SCREENSHOT_CAP_FILE" | head -n1 | tr -d '\r\n')
+    case "$header_line" in
+        SCREENSHOT_ERR|SCREENSHOT_UNSUPPORTED)
+            kill "$catpid" 2>/dev/null; wait "$catpid" 2>/dev/null
+            _close_serial
+            write_screenshot_meta "$token $header_line"
+            return 0
+            ;;
+    esac
+    local w h size
+    read -r _ w h size <<< "$header_line"
+    hbytes=$(tail -c "+$((offset + 1))" "$SCREENSHOT_CAP_FILE" | head -n1 | wc -c)
+    local payload_start=$((offset + hbytes + 1))
+    write_screenshot_progress "$token" 0 "$size"
+
+    # Payload: deadline scales with size — a full frame runs 13-40s on the
+    # wire alone at this fixed 115200 baud (mirrors the firmware's own
+    # budget for the no-PSRAM streaming path: deadline_ms = 5000 + buf_size/6
+    # in main.cpp's send_screenshot()).
+    local pdeadline=$((SECONDS + 8 + size / 3000)) cap_bytes have_bytes
+    while true; do
+        cap_bytes=$(stat -c%s "$SCREENSHOT_CAP_FILE" 2>/dev/null || echo 0)
+        have_bytes=$((cap_bytes - payload_start + 1))
+        [ "$have_bytes" -lt 0 ] && have_bytes=0
+        [ "$have_bytes" -gt "$size" ] && have_bytes=$size
+        write_screenshot_progress "$token" "$have_bytes" "$size"
+        [ "$have_bytes" -ge "$size" ] && break
+        if [ "$SECONDS" -ge "$pdeadline" ]; then
+            kill "$catpid" 2>/dev/null; wait "$catpid" 2>/dev/null
+            _close_serial
+            write_screenshot_meta "$token TIMEOUT_PAYLOAD"
+            return 0
+        fi
+        sleep 0.2
+    done
+    kill "$catpid" 2>/dev/null; wait "$catpid" 2>/dev/null
+    _close_serial
+
+    if tail -c "+$payload_start" "$SCREENSHOT_CAP_FILE" | head -c "$size" > "$SCREENSHOT_RAW_FILE.tmp" \
+        && [ "$(stat -c%s "$SCREENSHOT_RAW_FILE.tmp" 2>/dev/null || echo 0)" -eq "$size" ]; then
+        mv -f "$SCREENSHOT_RAW_FILE.tmp" "$SCREENSHOT_RAW_FILE"
+        write_screenshot_meta "$token OK $w $h $size"
+        log "Screenshot captured (${w}x${h}, $size bytes)"
+    else
+        rm -f "$SCREENSHOT_RAW_FILE.tmp"
+        write_screenshot_meta "$token TIMEOUT_PAYLOAD"
+    fi
+    rm -f "$SCREENSHOT_CAP_FILE"
+}
+
 # --- Live session awareness (issue #135) -----------------------------------
 # The session sidecar (spawned above by start_sessions_sidecar(); see
 # SESSIONS.md) listens for Claude Code hook events and writes an
@@ -839,6 +973,11 @@ start_sessions_sidecar
 BACKOFF=1
 
 while true; do
+    # Answer any screenshot request that arrives between reconnect attempts
+    # (neither inner loop running right now, so we're not confirmed to be
+    # on serial at this exact instant).
+    service_screenshot_request ""
+
     # Prefer USB serial: no BLE pairing needed, and this runs at the top of
     # every reconnect cycle, so plugging the board in while running on BLE
     # picks it up the next time this loop comes back around (worst case,
@@ -850,6 +989,7 @@ while true; do
         LAST_POLL=0
         LAST_SESSIONS_SIG=""  # resend current sessions to this freshly-seen device
         while [ -e "$SERIAL_PORT" ]; do
+            service_screenshot_request "$SERIAL_PORT"
             NOW=$(date +%s)
             if (( NOW - LAST_POLL >= POLL_INTERVAL )); then
                 payload=$(build_active_payload) && {
@@ -918,6 +1058,9 @@ while true; do
     # interval has elapsed OR when the ESP requested a refresh.
     LAST_POLL=0
     while is_connected; do
+        # We're on BLE right now, not serial — answer any pending screenshot
+        # request with NOT_ON_SERIAL instead of leaving it to time out.
+        service_screenshot_request ""
         NOW=$(date +%s)
         if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
             # Checked here (once per poll, not every $TICK) rather than in the
