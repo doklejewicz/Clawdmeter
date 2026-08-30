@@ -14,6 +14,23 @@ PORT="${1:-/dev/ttyUSB0}"
 [ -c "$PORT" ] || { echo "not a character device: $PORT" >&2; exit 1; }
 stty -F "$PORT" 115200 raw -echo
 
+# Renders an updating progress bar on stderr (stdout stays clean/scriptable).
+# $2 empty/0 means "total not known yet" — shows a waiting indicator instead
+# of a bar, since the header (and so the expected size) isn't parsed until
+# some bytes have already arrived.
+_progress() {
+    [ -t 2 ] || return 0
+    local cur="$1" total="${2:-0}" width=30
+    if [ "$total" -gt 0 ]; then
+        local filled=$((width * cur / total))
+        [ "$filled" -gt "$width" ] && filled=$width
+        printf '\r[%-*s] %3d%% (%d/%d bytes)  ' "$width" \
+            "$(printf '%*s' "$filled" '' | tr ' ' '#')" "$((cur * 100 / total))" "$cur" "$total"
+    else
+        printf '\rWaiting for device...  '
+    fi
+}
+
 # Verify-and-retry, not just a length check: this link has no flow control,
 # and a dropped byte mid-transfer doesn't shorten what the reader receives
 # (it just reads further into the trailing SETUP_END marker to make up the
@@ -38,10 +55,28 @@ for attempt in 1 2 3 4 5 6; do
     echo get-setup >&3
 
     deadline=$((SECONDS + 12))
+    _p_total=0
     while [ "$SECONDS" -lt "$deadline" ]; do
+        cur=$(stat -c%s raw.bin 2>/dev/null || echo 0)
+        # Best-effort early peek at the header so the bar can show a real
+        # percentage instead of just "waiting" — separate var names so this
+        # can't clobber the authoritative parse done after the loop exits.
+        if [ "$_p_total" -eq 0 ]; then
+            _p_offset=$(grep -abo 'SETUP_START' raw.bin 2>/dev/null | head -1 | cut -d: -f1)
+            if [ -n "$_p_offset" ]; then
+                _p_header=$(tail -c +"$((_p_offset + 1))" raw.bin | head -n1 | tr -d '\r\n')
+                read -r _ _p_size _ <<< "$_p_header"
+                if [ -n "$_p_size" ]; then
+                    _p_hbytes=$(tail -c +"$((_p_offset + 1))" raw.bin | head -n1 | wc -c)
+                    _p_total=$((_p_offset + _p_hbytes + _p_size))
+                fi
+            fi
+        fi
+        _progress "$cur" "$_p_total"
         grep -aq 'SETUP_END\|SETUP_UNSUPPORTED\|SETUP_ERR' raw.bin 2>/dev/null && break
         sleep 0.1
     done
+    [ -t 2 ] && printf '\n' >&2
     kill "$catpid" 2>/dev/null
     wait "$catpid" 2>/dev/null
     exec 3<&-
