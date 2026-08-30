@@ -40,7 +40,7 @@ struct Layout {
     int16_t bar_h;
     int16_t panel_pad_x, panel_pad_y;
     int16_t pill_pad_x, pill_pad_y;
-    const lv_font_t* title_font;     // screen title / clock
+    const lv_font_t* title_font;     // screen title / clock — same size as "Usage"
     const lv_font_t* pct_font;       // big percentage number
     const lv_font_t* ent_pct_font;   // enterprise spending number
     const lv_font_t* pill_font;      // "Current" / "Weekly" pill
@@ -49,10 +49,13 @@ struct Layout {
     const lv_font_t* anim_font;      // animated status line
     int16_t anim_y;                  // status line offset from bottom
     bool    small_icons;             // 40px logo + 24px battery (vs 80/48) on small screens
-    int16_t title_nudge;             // title x-shift balancing the corner logo
     int16_t logo_y;                  // logo top edge
     int16_t batt_y;                  // battery icon top edge
     int16_t batt_w;                  // battery icon width, for position math
+    int16_t conn_icon_gap;           // spacing between the battery/BLE/serial icon row
+    int16_t conn_row_margin;         // right-edge inset for that row — tighter than
+                                      // L.margin so the cluster hugs the corner and
+                                      // leaves the title/clock more room to center in
 
     // Pairing hint / idle screen
     int16_t pair_y1, pair_y2, pair_y3;
@@ -95,10 +98,11 @@ static void compute_layout(const BoardCaps& c) {
     L.anim_font    = &font_mono_32;
     L.anim_y = -15;
     L.small_icons = false;
-    L.title_nudge = 16;
     L.logo_y = L.title_y - 10;
     L.batt_y = L.title_y;
     L.batt_w = ICON_BATTERY_W;
+    L.conn_icon_gap = 4;
+    L.conn_row_margin = 8;
     L.pair_y1 = 40;
     L.pair_y2 = 120;
     L.pair_y3 = 160;
@@ -159,10 +163,11 @@ static void compute_layout(const BoardCaps& c) {
         // against the bottom edge it reads as unevenly spaced.
         L.anim_y = -10;
         L.small_icons = true;
-        L.title_nudge = 8;
         L.logo_y = 2;
         L.batt_y = 10;
         L.batt_w = ICON_BATTERY_SMALL_W;
+        L.conn_icon_gap = 3;
+        L.conn_row_margin = 4;
         L.pair_y1 = 12;
         L.pair_y2 = 56;
         L.pair_y3 = 80;
@@ -200,7 +205,7 @@ static lv_obj_t* lbl_title;
 static long     clock_base_epoch = 0;
 static uint32_t clock_base_ms = 0;
 static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
-static int      clock_last_min = -1;   // last rendered minute; avoids redrawing the title every tick
+static long     clock_last_epoch = -1;   // last rendered second; avoids redrawing the title every tick
 static lv_obj_t* usage_group;   // the two usage panels — shown when connected
 static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
 static lv_obj_t* bar_session;
@@ -223,6 +228,25 @@ static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idl
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
 static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
+
+// ---- Transport status icons (shared, on top, left of the battery icon) ----
+// Both transports are always live on the firmware side (see check_serial_cmd()
+// and the ble_has_data() branch in main.cpp's loop()) — these two icons just
+// report which one(s) a host is actually using right now. Bluetooth reflects
+// the real GATT connection state; USB serial has no such notion (any line
+// received is just processed), so its state is inferred from how recently a
+// valid payload arrived, using the same DATA_FRESH_MS margin BLE payloads are
+// judged "live" by.
+static lv_obj_t* bt_icon_img;
+static lv_obj_t* serial_icon_img;
+static lv_image_dsc_t bt_icon_dsc;
+static lv_image_dsc_t serial_icon_dsc;
+static bool     s_ble_ever_connected = false;  // gray (never used) vs red (used, now down)
+static bool     s_serial_ever_active = false;  // gray (never used) vs red (used, now stale)
+static uint32_t s_last_serial_ms = 0;
+static lv_color_t s_bt_icon_col;
+static lv_color_t s_serial_icon_col;
+static bool     s_icon_col_init = false;
 
 // ---- Live-data freshness → which usage sub-view to show ----
 // usage panels when data is flowing, an idle "Zzz" screen when the host is
@@ -388,6 +412,15 @@ static void init_battery_icons(void) {
     init_icon_dsc_rgb565a8(&battery_dscs[4], ICON_BATTERY_CHARGING_W, ICON_BATTERY_CHARGING_H, icon_battery_charging_data);
 }
 
+// Always the compact 24px size, even at the large breakpoint — these are
+// secondary status glyphs, not primary content like the battery gauge, and
+// staying small leaves more room for the title/clock text between them and
+// the corner logo (see the title-box math next to lbl_title's creation).
+static void init_conn_icons(void) {
+    init_icon_dsc_rgb565a8(&bt_icon_dsc, ICON_BLUETOOTH_SMALL_W, ICON_BLUETOOTH_SMALL_H, icon_bluetooth_small_data);
+    init_icon_dsc_rgb565a8(&serial_icon_dsc, ICON_SERIAL_SMALL_W, ICON_SERIAL_SMALL_H, icon_serial_small_data);
+}
+
 // ======== Usage Screen ========
 
 static lv_obj_t* make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
@@ -479,6 +512,7 @@ static void build_idle_group(lv_obj_t* parent) {
 
 static void update_view_state(void);       // defined below ui_update
 static void apply_anim_visibility(void);   // status-line rule (§2.3)
+static void update_connection_icons(void); // defined below, near ui_update_ble_status
 
 #if BOARD_HAS_SESSION_VIEWS
 
@@ -1473,9 +1507,14 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_label_set_text(lbl_title, "Usage");
     lv_obj_set_style_text_font(lbl_title, L.title_font, 0);
     lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
-    // The nudge balances the corner logo on the left; smaller on small
-    // screens where the logo is 40px and the battery icon sits closer.
-    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+    // Clip rather than wrap: a label this is genuinely too wide for its box
+    // should lose its tail, not push a second line into the panel below.
+    // Cheap insurance for "Sessions" (BOARD_HAS_SESSION_VIEWS), untested here since
+    // sim doesn't build that feature.
+    lv_label_set_long_mode(lbl_title, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_width(lbl_title, L.scr_w - 2 * L.margin);
+    lv_obj_set_style_text_align(lbl_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, L.title_y);
 
     // Usage panels (shown when connected) live in a transparent full-size group
     // so they can be toggled against the pairing hint as one unit.
@@ -1548,6 +1587,7 @@ void ui_init(void) {
     else               init_icon_dsc_rgb565a8(&logo_dsc, CLAWD_STILL_W, CLAWD_STILL_H, clawd_still_data);
 #endif
     init_battery_icons();
+    init_conn_icons();
 
     init_usage_screen(scr);
     splash_init(scr);
@@ -1572,9 +1612,33 @@ void ui_init(void) {
 #endif
     }
 
+    // Transport icons sit left of the battery icon, hugging the corner:
+    // [serial][bluetooth][battery]. Uses conn_row_margin (tighter than the
+    // L.margin the rest of the screen uses) so the cluster stays compact and
+    // leaves the title/clock as much centered room as possible. Always the
+    // small 24px size (see init_conn_icons()) regardless of L.batt_w, so
+    // vertically center them against the battery icon's row rather than
+    // sharing its top edge.
+    const int16_t battery_x = L.scr_w - L.batt_w - L.conn_row_margin;
+    const int16_t bt_icon_x = battery_x - L.conn_icon_gap - ICON_BLUETOOTH_SMALL_W;
+    const int16_t serial_icon_x = bt_icon_x - L.conn_icon_gap - ICON_SERIAL_SMALL_W;
+    const int16_t conn_icon_y = L.batt_y + (L.batt_w - ICON_BLUETOOTH_SMALL_H) / 2;
+
+    bt_icon_img = lv_image_create(scr);
+    lv_image_set_src(bt_icon_img, &bt_icon_dsc);
+    lv_obj_set_pos(bt_icon_img, bt_icon_x, conn_icon_y);
+    lv_obj_set_style_image_recolor_opa(bt_icon_img, LV_OPA_COVER, 0);
+    lv_obj_set_style_image_recolor(bt_icon_img, COL_DIM, 0);
+
+    serial_icon_img = lv_image_create(scr);
+    lv_image_set_src(serial_icon_img, &serial_icon_dsc);
+    lv_obj_set_pos(serial_icon_img, serial_icon_x, conn_icon_y);
+    lv_obj_set_style_image_recolor_opa(serial_icon_img, LV_OPA_COVER, 0);
+    lv_obj_set_style_image_recolor(serial_icon_img, COL_DIM, 0);
+
     battery_img = lv_image_create(scr);
     lv_image_set_src(battery_img, &battery_dscs[0]);
-    lv_obj_set_pos(battery_img, L.scr_w - L.batt_w - L.margin, L.batt_y);
+    lv_obj_set_pos(battery_img, battery_x, L.batt_y);
     // Boards without battery telemetry never show the indicator (per the HAL
     // contract; previously every board drew the empty-battery glyph).
     if (!board_caps().has_battery) {
@@ -1596,7 +1660,7 @@ void ui_update(const UsageData* data) {
         clock_fmt = data->clock_fmt;
     } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
         clock_base_epoch = 0;
-        clock_last_min = -1;
+        clock_last_epoch = -1;
         lv_label_set_text(lbl_title, "Usage");
     }
 
@@ -1757,8 +1821,12 @@ static void update_view_state(void) {
         v = 1;  // idle / Zzz
     }
     if (v == view_state) return;
+#if BOARD_HAS_SESSION_VIEWS
     Serial.printf("view_state: %d -> %d (live=%d waiting=%d fresh=%d)\n",
                   view_state, v, s_live_count, s_any_waiting, fresh);
+#else
+    Serial.printf("view_state: %d -> %d (fresh=%d)\n", view_state, v, fresh);
+#endif
     view_state = v;
     // Instant swap. §2.3's 280 ms RESTING↔chat cross-fade is deliberately
     // deferred — the existing sub-view pattern is instant, and the fade is
@@ -1784,9 +1852,9 @@ static void update_view_state(void) {
         }
     } else {
         // Leaving the session view: restore the title now instead of
-        // waiting up to 60s for the next clock minute-tick to overwrite it.
+        // waiting up to a second for the next clock tick to overwrite it.
         lv_label_set_text(lbl_title, "Usage");
-        clock_last_min = -1;
+        clock_last_epoch = -1;
         lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
                           LV_OBJ_FLAG_HIDDEN);
     }
@@ -1794,22 +1862,30 @@ static void update_view_state(void) {
     lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
                       LV_OBJ_FLAG_HIDDEN);
 #endif
+#if BOARD_HAS_SESSION_VIEWS
     Serial.printf("  after swap: usage_hidden=%d focus_hidden=%d chats_hidden=%d\n",
                   lv_obj_has_flag(usage_group, LV_OBJ_FLAG_HIDDEN),
                   focus_group ? lv_obj_has_flag(focus_group, LV_OBJ_FLAG_HIDDEN) : -1,
                   chats_group ? lv_obj_has_flag(chats_group, LV_OBJ_FLAG_HIDDEN) : -1);
+#else
+    Serial.printf("  after swap: usage_hidden=%d\n",
+                  lv_obj_has_flag(usage_group, LV_OBJ_FLAG_HIDDEN));
+#endif
     apply_anim_visibility();
 }
 
 void ui_tick_anim(void) {
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
+    // Only BLE connect/disconnect and a serial payload landing are otherwise
+    // event-driven — serial going stale (green -> red) needs a poll.
+    update_connection_icons();
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
 
     uint32_t now = lv_tick_get();
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
-    // the live time, advanced locally so it ticks every minute between payloads.
+    // the live time, advanced locally so it ticks every second between payloads.
     // Suppressed while a session view is up (title reads "Sessions" there instead
     // — see the view-swap block in update_view_state()).
 #if BOARD_HAS_SESSION_VIEWS
@@ -1818,18 +1894,18 @@ void ui_tick_anim(void) {
     if (clock_base_epoch > 0) {
 #endif
         time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
-        struct tm tmv;
-        gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is
-        if (tmv.tm_min != clock_last_min) {   // only rewrite the title when the minute changes
-            clock_last_min = tmv.tm_min;
-            char tbuf[12];
+        if (cur != clock_last_epoch) {   // only rewrite the title when the second changes
+            clock_last_epoch = cur;
+            struct tm tmv;
+            gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is
+            char tbuf[16];
             if (clock_fmt == 12) {
                 int h12 = tmv.tm_hour % 12;
                 if (h12 == 0) h12 = 12;
-                snprintf(tbuf, sizeof(tbuf), "%d:%02d %s", h12, tmv.tm_min,
+                snprintf(tbuf, sizeof(tbuf), "%d:%02d:%02d %s", h12, tmv.tm_min, tmv.tm_sec,
                          tmv.tm_hour < 12 ? "AM" : "PM");
             } else {
-                snprintf(tbuf, sizeof(tbuf), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+                snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
             }
             lv_label_set_text(lbl_title, tbuf);
         }
@@ -1871,9 +1947,21 @@ void ui_tick_anim(void) {
 
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
 static void apply_battery_visibility(void) {
-    if (!battery_img) return;
-    if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-    else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    const bool hide = (current_screen == SCREEN_SPLASH);
+    if (battery_img) {
+        if (hide) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    // Transport icons share the battery icon's row, so they share its
+    // splash-only hidden state too — there's no separate "hasn't got one"
+    // case to gate on the way battery_img's existence does.
+    if (hide) {
+        lv_obj_add_flag(bt_icon_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(serial_icon_img, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(bt_icon_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(serial_icon_img, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void global_click_cb(lv_event_t* e) {
@@ -1912,12 +2000,51 @@ screen_t ui_get_current_screen(void) {
     return current_screen;
 }
 
+// Recolors the two transport icons: green while live, gray if that transport
+// has never been used, red if it was used before but has since gone quiet.
+// Cheap to call every tick — only writes a style when a color actually
+// changes (lv_color_eq(), not the raw struct, since LVGL 9's lv_color_t
+// isn't guaranteed a single comparable field across color depths).
+static void update_connection_icons(void) {
+    if (!bt_icon_img || !serial_icon_img) return;
+
+    lv_color_t bt_col = !s_ble_ever_connected ? COL_DIM
+                       : s_ble_connected       ? COL_GREEN
+                                               : COL_RED;
+    bool serial_fresh = s_serial_ever_active &&
+                         (lv_tick_get() - s_last_serial_ms < DATA_FRESH_MS);
+    lv_color_t serial_col = !s_serial_ever_active ? COL_DIM
+                           : serial_fresh          ? COL_GREEN
+                                                   : COL_RED;
+
+    if (!s_icon_col_init || !lv_color_eq(bt_col, s_bt_icon_col)) {
+        lv_obj_set_style_image_recolor(bt_icon_img, bt_col, 0);
+        s_bt_icon_col = bt_col;
+    }
+    if (!s_icon_col_init || !lv_color_eq(serial_col, s_serial_icon_col)) {
+        lv_obj_set_style_image_recolor(serial_icon_img, serial_col, 0);
+        s_serial_icon_col = serial_col;
+    }
+    s_icon_col_init = true;
+}
+
+// Called from main.cpp whenever check_serial_cmd() successfully applies a
+// usage JSON payload received over USB serial — the only signal this
+// connectionless transport has that a host is actually out there.
+void ui_note_serial_activity(void) {
+    s_serial_ever_active = true;
+    s_last_serial_ms = lv_tick_get();
+    update_connection_icons();
+}
+
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
     (void)name; (void)mac;
     bool was_connected = s_ble_connected;
     s_ble_connected = (state == BLE_STATE_CONNECTED);
+    if (s_ble_connected) s_ble_ever_connected = true;
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
+    update_connection_icons();
     // pair / idle / usage — picked from connection + data freshness.
     update_view_state();
 }

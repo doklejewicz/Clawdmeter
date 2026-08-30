@@ -21,3 +21,8 @@ void ui_toggle_splash(void);
 screen_t ui_get_current_screen(void);
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac);
 void ui_update_battery(int percent, bool charging);
+// Reports a successfully applied usage payload received over USB serial, so
+// the serial transport-status icon can show "live" — see check_serial_cmd()
+// in main.cpp. No serial equivalent of ui_update_ble_status() exists because
+// the transport itself has no connection state, only individual payloads.
+void ui_note_serial_activity(void);
