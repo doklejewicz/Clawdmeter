@@ -233,6 +233,39 @@ read_token_for() {
         | grep -o '"accessToken":"[^"]*"' | head -1 | cut -d'"' -f4
 }
 
+# Read the account identity the CLI already cached the last time it talked to
+# Anthropic (email + org name) — avoids adding a second outbound API call just
+# for display purposes. Lives in "<dir>.json" (the CLI's top-level settings
+# file, a sibling of the credentials dir, e.g. ~/.claude.json next to
+# ~/.claude/) under "oauthAccount"; falls back to the default ~/.claude.json
+# if a custom config dir doesn't have its own sibling file (unconfirmed
+# whether CLAUDE_CONFIG_DIR ever namespaces this cache — better to fall back
+# than to silently show nothing for multi-profile setups).
+# This file is pretty-printed (one "key": "value" per line) with
+# "oauthAccount" itself containing a nested {} — so grabbing everything
+# between its braces with a single-line regex (the read_token_for approach
+# above) doesn't work here. Grep the whole file for these two keys directly
+# instead; verified against a real ~/.claude.json that both are unique to
+# the oauthAccount block (the rest of the file is CLI/project cache, not
+# account fields), so no separate scoping step is needed.
+# Echoes "email<TAB>org" (either half may be empty).
+read_account_info_for() {
+    local dir="$1"
+    local json_file="${dir}.json"
+    [ -f "$json_file" ] || json_file="$HOME/.claude.json"
+    local email org
+    email=$(grep -o '"emailAddress"[[:space:]]*:[[:space:]]*"[^"]*"' "$json_file" 2>/dev/null | head -1 | cut -d'"' -f4)
+    org=$(grep -o '"organizationName"[[:space:]]*:[[:space:]]*"[^"]*"' "$json_file" 2>/dev/null | head -1 | cut -d'"' -f4)
+    printf '%s\t%s' "$email" "$org"
+}
+
+# Minimal JSON string escaping (backslash and double-quote) for values pulled
+# from external config rather than built by us, before splicing into the
+# hand-built payload strings below.
+_json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
 # Read the `chime` option from the config file. Echoes one of: off|on.
 # Defaults to "off" so the device stays silent until the user opts in.
 read_chime_setting() {
@@ -783,6 +816,7 @@ maybe_send_sessions_serial() {
 # transport loop) owns actually sending it.
 build_payload_for_token() {
     local token="$1"
+    local dir="$2"
     [ -z "$token" ] && return 1
     local now
     now=$(date +%s)
@@ -829,6 +863,15 @@ build_payload_for_token() {
     chime=$(read_chime_setting)
     [ "$chime" = "on" ] && chime_fragment=",\"c\":1"
 
+    # Account identity for the Settings screen — cheap (a local file read,
+    # no extra API call), so always included when available rather than
+    # gated by a setting like clock/chime above.
+    local email org acct_fragment=""
+    IFS=$'\t' read -r email org < <(read_account_info_for "$dir")
+    if [ -n "$email" ] || [ -n "$org" ]; then
+        acct_fragment=",\"em\":\"$(_json_escape "$email")\",\"og\":\"$(_json_escape "$org")\""
+    fi
+
     local payload
     if [ -n "$s5h_util" ]; then
         # Pro/Max account — 5h/7d windows
@@ -840,13 +883,13 @@ build_payload_for_token() {
         s5h_util=${s5h_util:-0}; s5h_reset=${s5h_reset:-0}
         s7d_util=${s7d_util:-0}; s7d_reset=${s7d_reset:-0}
         s5h_status=${s5h_status:-unknown}
-        payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$s5h_status" -v now="$now" -v clk="$clock_fragment" -v chm="$chime_fragment" \
+        payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$s5h_status" -v now="$now" -v clk="$clock_fragment" -v chm="$chime_fragment" -v acc="$acct_fragment" \
             'BEGIN {
                 sp = sprintf("%.0f", u5 * 100);
                 sr = (r5 - now) / 60; sr = sr > 0 ? sprintf("%.0f", sr) : 0;
                 wp = sprintf("%.0f", u7 * 100);
                 wr = (r7 - now) / 60; wr = wr > 0 ? sprintf("%.0f", wr) : 0;
-                printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"acct\":\"pro\"%s%s,\"ok\":true}", sp, sr, wp, wr, st, clk, chm;
+                printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"acct\":\"pro\"%s%s%s,\"ok\":true}", sp, sr, wp, wr, st, clk, chm, acc;
             }')
     else
         # Enterprise account — spending-limit model
@@ -868,7 +911,7 @@ rd = f"{dt_end.strftime('%b')} {dt_end.day}"
 print(json.dumps({"tp": tp, "pd": pd_days, "rd": rd}))
 PYEOF
 )
-        payload=$(awk -v ou="$overage_util" -v or_="$overage_reset" -v st="$status" -v now="$now" -v pi="$period_info" -v clk="$clock_fragment" -v chm="$chime_fragment" \
+        payload=$(awk -v ou="$overage_util" -v or_="$overage_reset" -v st="$status" -v now="$now" -v pi="$period_info" -v clk="$clock_fragment" -v chm="$chime_fragment" -v acc="$acct_fragment" \
             'BEGIN {
                 sp = sprintf("%.0f", ou * 100);
                 sr = (or_ - now) / 60; sr = sr > 0 ? sprintf("%.0f", sr) : 0;
@@ -877,7 +920,7 @@ PYEOF
                 match(pi, /"tp": *([0-9]+)/, a); if (RSTART) tp = a[1];
                 match(pi, /"pd": *([0-9]+)/, b); if (RSTART) pd = b[1];
                 match(pi, /"rd": *"([^"]+)"/, c); if (RSTART) rd = c[1];
-                printf "{\"s\":%s,\"sr\":%s,\"w\":0,\"wr\":0,\"st\":\"%s\",\"acct\":\"ent\",\"tp\":%s,\"pd\":%s,\"rd\":\"%s\"%s%s,\"ok\":true}", sp, sr, st, tp, pd, rd, clk, chm;
+                printf "{\"s\":%s,\"sr\":%s,\"w\":0,\"wr\":0,\"st\":\"%s\",\"acct\":\"ent\",\"tp\":%s,\"pd\":%s,\"rd\":\"%s\"%s%s%s,\"ok\":true}", sp, sr, st, tp, pd, rd, clk, chm, acc;
             }')
     fi
 
@@ -912,7 +955,7 @@ build_active_payload() {
             log "No token in $dir; skipping"
             continue
         fi
-        payload=$(build_payload_for_token "$token") || { log "API call failed for $dir"; continue; }
+        payload=$(build_payload_for_token "$token" "$dir") || { log "API call failed for $dir"; continue; }
         [ -z "$payload" ] && continue
         s=$(_payload_session_pct "$payload"); s=${s:-0}
         cycle_payload["$dir"]="$payload"

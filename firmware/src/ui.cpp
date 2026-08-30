@@ -10,6 +10,7 @@
 #include "icons.h"
 #include "hal/board_caps.h"
 #include "settings.h"
+#include "ble.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -282,9 +283,11 @@ static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("C
 static lv_obj_t* settings_container;
 static lv_obj_t* settings_icon_img;   // corner icon, fixed position on `scr` — see init_settings_screen()
 static lv_obj_t* settings_tap_zone;   // enlarged invisible tap target — see ui_init()
-static lv_obj_t* lbl_set_session;
-static lv_obj_t* lbl_set_weekly;
+static lv_obj_t* lbl_set_email;
+static lv_obj_t* lbl_set_org;
 static lv_obj_t* lbl_set_account;
+static lv_obj_t* lbl_set_device;   // set once at init — ble_get_device_name() doesn't change at runtime
+static lv_obj_t* lbl_set_mac;      // set once at init — ble_get_mac_address() is factory-burned per-chip
 static lv_obj_t* lbl_fps_value;
 static lv_obj_t* lbl_transport_value;
 static lv_obj_t* lbl_clockfmt_value;
@@ -1794,9 +1797,29 @@ static void init_settings_screen(lv_obj_t* scr) {
         lv_obj_clear_flag(icon_spacer, LV_OBJ_FLAG_SCROLLABLE);
     }
 
-    lbl_set_session = make_settings_label(settings_scroll, "Session: --%", COL_TEXT);
-    lbl_set_weekly  = make_settings_label(settings_scroll, "Weekly: --%", COL_TEXT);
+    // Session/Weekly already live on the main Usage screen — showing them
+    // again here was pure duplication. Account identity instead: email/org
+    // come from the daemon (may arrive a poll cycle after boot, hence the
+    // "--" placeholder), device name/MAC are static device-side facts set
+    // once below rather than refreshed with usage data.
+    lbl_set_email   = make_settings_label(settings_scroll, "Email: --", COL_TEXT);
+    lbl_set_org     = make_settings_label(settings_scroll, "Org: --", COL_TEXT);
     lbl_set_account = make_settings_label(settings_scroll, "Account: --", COL_DIM);
+    lbl_set_device  = make_settings_label(settings_scroll, "Device: --", COL_DIM);
+    lbl_set_mac     = make_settings_label(settings_scroll, "MAC: --", COL_DIM);
+    // Long values (email addresses especially) can exceed even the large
+    // tier's width — ellipsize rather than overflow past the screen edge.
+    lv_obj_t* id_labels[] = {lbl_set_email, lbl_set_org, lbl_set_device, lbl_set_mac};
+    for (lv_obj_t* l : id_labels) {
+        lv_obj_set_width(l, LV_PCT(100));
+        // DOTS mode only truncates (rather than word-wrapping) when the
+        // object has a fixed one-line height — LV_SIZE_CONTENT lets it grow
+        // to fit the wrapped text instead, which defeats the point.
+        lv_obj_set_height(l, lv_font_get_line_height(L.bt_device_font));
+        lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_DOTS);
+    }
+    lv_label_set_text_fmt(lbl_set_device, "Device: %s", ble_get_device_name());
+    lv_label_set_text_fmt(lbl_set_mac, "MAC: %s", ble_get_mac_address());
 
     lv_obj_t* sep = lv_label_create(settings_scroll);
     lv_label_set_text(sep, "");
@@ -1855,9 +1878,11 @@ static void init_settings_screen(lv_obj_t* scr) {
 // of this file already makes for hidden panels.
 static void refresh_settings_usage_labels(void) {
     const UsageData* d = &s_settings_usage;
-    if (!lbl_set_session) return;
-    lv_label_set_text_fmt(lbl_set_session, "Session: %d%%", (int)(d->session_pct + 0.5f));
-    lv_label_set_text_fmt(lbl_set_weekly, "Weekly: %d%%", (int)(d->weekly_pct + 0.5f));
+    if (!lbl_set_email) return;
+    // Older daemons (pre account-info support) never send "em"/"og" — leave
+    // the "--" placeholder rather than blanking the row.
+    if (d->email[0]) lv_label_set_text_fmt(lbl_set_email, "Email: %s", d->email);
+    if (d->org[0])   lv_label_set_text_fmt(lbl_set_org, "Org: %s", d->org);
     lv_label_set_text(lbl_set_account, d->enterprise ? "Account: Enterprise" : "Account: Pro");
 }
 
