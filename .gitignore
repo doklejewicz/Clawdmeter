@@ -6,9 +6,10 @@ firmware/.vscode/
 # flashed to SPIFFS via `pio run -t uploadfs`, not source
 firmware/data/setup.sh
 
-# Downloaded by tools/get_setup.sh's `get-setup` serial command when run
-# from the repo root instead of a scratch dir
+# Downloaded/captured by tools/get_setup.sh's `get-setup` serial command
+# when run from the repo root instead of a scratch dir
 /setup.sh
+/raw.bin
 
 # OS
 .DS_Store
