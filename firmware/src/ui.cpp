@@ -5,8 +5,11 @@
 #include <time.h>
 #include "logo.h"
 #include "clawd_still.h"
+#include "clawd_settings.h"
+#include "clawd_sessions.h"
 #include "icons.h"
 #include "hal/board_caps.h"
+#include "settings.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -204,7 +207,11 @@ static lv_obj_t* lbl_title;
 // which it landed, so the title ticks forward locally between 60s payloads.
 static long     clock_base_epoch = 0;
 static uint32_t clock_base_ms = 0;
-static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
+static int      clock_fmt = 24;   // 12 or 24 — a device-owned display setting
+                                   // (Settings screen); loaded in ui_init(),
+                                   // NOT read from the daemon's "tf" field —
+                                   // the device already has the raw epoch, so
+                                   // formatting it is purely a local concern.
 static long     clock_last_epoch = -1;   // last rendered second; avoids redrawing the title every tick
 static lv_obj_t* usage_group;   // the two usage panels — shown when connected
 static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
@@ -261,9 +268,30 @@ static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within t
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
+static lv_image_dsc_t settings_icon_dsc;
+#if BOARD_HAS_SESSION_VIEWS
+#ifndef BOARD_HAS_PSRAM
+static lv_image_dsc_t sessions_icon_dsc;   // corner-mascot swap while a session view is active — see clawd_sessions.h
+#endif
+#endif
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
+
+// ---- Settings screen (tap the corner mascot from the usage screen) ----
+static lv_obj_t* settings_container;
+static lv_obj_t* settings_icon_img;   // corner icon, fixed position on `scr` — see init_settings_screen()
+static lv_obj_t* settings_tap_zone;   // enlarged invisible tap target — see ui_init()
+static lv_obj_t* lbl_set_session;
+static lv_obj_t* lbl_set_weekly;
+static lv_obj_t* lbl_set_account;
+static lv_obj_t* lbl_fps_value;
+static lv_obj_t* lbl_transport_value;
+static lv_obj_t* lbl_clockfmt_value;
+// Always kept current regardless of BOARD_HAS_SESSION_VIEWS (unlike
+// s_usage_cache below, which only tracks it on boards with session views) —
+// the Settings screen's usage summary needs to work on every board.
+static UsageData s_settings_usage = {};
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -339,6 +367,7 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
+static void open_settings_cb(lv_event_t* e);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -513,6 +542,7 @@ static void build_idle_group(lv_obj_t* parent) {
 static void update_view_state(void);       // defined below ui_update
 static void apply_anim_visibility(void);   // status-line rule (§2.3)
 static void update_connection_icons(void); // defined below, near ui_update_ble_status
+static void refresh_settings_usage_labels(void);  // defined below, near init_settings_screen
 
 #if BOARD_HAS_SESSION_VIEWS
 
@@ -1572,6 +1602,232 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
 }
 
+// ---- Settings screen (tap the corner mascot from the usage screen) ----
+// First pass: a single flex-column list rather than the hand-tuned per-tier
+// pixel layout the rest of the file uses (see Layout struct) — simplest way
+// to fit a growing, freely-orderable list of rows across every screen size
+// without new per-tier constants for each one. Revisit if this needs to
+// match the rest of the app's visual density more closely.
+
+static lv_obj_t* make_settings_row(lv_obj_t* parent) {
+    lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, L.small_icons ? 1 : 4, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    return row;
+}
+
+static lv_obj_t* make_settings_label(lv_obj_t* parent, const char* text, lv_color_t col) {
+    lv_obj_t* l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(l, col, 0);
+    return l;
+}
+
+// Small pill button — label + tap target. Value text set separately via the
+// returned label so callbacks can update it in place.
+static lv_obj_t* make_settings_button(lv_obj_t* parent, lv_event_cb_t cb, lv_obj_t** out_label) {
+    lv_obj_t* btn = lv_button_create(parent);
+    lv_obj_set_style_bg_color(btn, COL_BAR_BG, 0);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_hor(btn, L.small_icons ? 8 : 12, 0);
+    lv_obj_set_style_pad_ver(btn, L.small_icons ? 2 : 6, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    *out_label = lv_label_create(btn);
+    lv_obj_set_style_text_font(*out_label, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(*out_label, COL_TEXT, 0);
+    lv_obj_center(*out_label);
+    return btn;
+}
+
+static void fps_dec_cb(lv_event_t* e) {
+    (void)e;
+    uint8_t v = settings_get_fps();
+    settings_set_fps(v <= SETTINGS_FPS_MIN ? SETTINGS_FPS_MIN : v - SETTINGS_FPS_STEP);
+    lv_label_set_text_fmt(lbl_fps_value, "%u", settings_get_fps());
+}
+
+static void fps_inc_cb(lv_event_t* e) {
+    (void)e;
+    uint8_t v = settings_get_fps();
+    settings_set_fps(v >= SETTINGS_FPS_MAX ? SETTINGS_FPS_MAX : v + SETTINGS_FPS_STEP);
+    lv_label_set_text_fmt(lbl_fps_value, "%u", settings_get_fps());
+}
+
+static void transport_cycle_cb(lv_event_t* e) {
+    (void)e;
+    transport_pref_t t = (transport_pref_t)((settings_get_transport() + 1) % TRANSPORT_COUNT);
+    settings_set_transport(t);
+    lv_label_set_text(lbl_transport_value, settings_transport_name(t));
+}
+
+static void clockfmt_cycle_cb(lv_event_t* e) {
+    (void)e;
+    uint8_t new_fmt = (settings_get_clock_format() == 24) ? 12 : 24;
+    settings_set_clock_format(new_fmt);
+    clock_fmt = new_fmt;
+    clock_last_epoch = -1;   // force the usage-screen title to redraw in the new format
+    lv_label_set_text_fmt(lbl_clockfmt_value, "%uh", new_fmt);
+}
+
+static void settings_back_cb(lv_event_t* e) {
+    (void)e;
+    ui_show_screen(SCREEN_USAGE);
+}
+
+static void init_settings_screen(lv_obj_t* scr) {
+    settings_container = lv_obj_create(scr);
+    lv_obj_set_size(settings_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(settings_container, 0, 0);
+    lv_obj_set_style_bg_color(settings_container, COL_BG, 0);
+    lv_obj_set_style_bg_opa(settings_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(settings_container, 0, 0);
+    lv_obj_set_style_pad_all(settings_container, L.margin, 0);
+    lv_obj_set_style_pad_row(settings_container, L.small_icons ? 2 : 6, 0);
+    // Scrollable rather than hand-fit to every tier — the smallest screens
+    // (240x240) can't fit the full list without it, and it costs nothing on
+    // the larger tiers where everything already fits.
+    lv_obj_set_scroll_dir(settings_container, LV_DIR_VER);
+    lv_obj_set_flex_flow(settings_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
+
+    // Fixed-pixel-size art rendered unscaled looks proportionally far
+    // bigger on a small low-res panel than a large one (confirmed on real
+    // CYD hardware — the large-only version overran this row) — same
+    // small/large split every other icon in this file already uses.
+    if (L.small_icons) {
+        init_icon_dsc_rgb565a8(&settings_icon_dsc, CLAWD_SETTINGS_SMALL_W, CLAWD_SETTINGS_SMALL_H, clawd_settings_small_data);
+    } else {
+        init_icon_dsc_rgb565a8(&settings_icon_dsc, CLAWD_SETTINGS_W, CLAWD_SETTINGS_H, clawd_settings_data);
+    }
+
+    // Icon lives on `scr` (like logo_img), not inside settings_container's
+    // flex flow — so it sits at a fixed corner position exactly like the
+    // usage-screen mascot, and the title text below is centered across the
+    // FULL width independent of the icon, matching how "Usage"/"Sessions"
+    // (lbl_title) centers regardless of the corner mascot's presence. An
+    // earlier version put icon+text in one flex row together, which made
+    // the text start right after the icon instead of centering — visibly
+    // inconsistent with every other screen's title treatment.
+    settings_icon_img = lv_image_create(scr);
+    lv_image_set_src(settings_icon_img, &settings_icon_dsc);
+    if (L.small_icons) {
+        // Same slot-centering formula as the corner mascot/logo_img below —
+        // CLAWD_SETTINGS_SMALL_H matches CLAWD_STILL_SMALL_H exactly, so
+        // this lines up with logo_img's own position pixel-for-pixel.
+        const int top = L.logo_y + (LOGO_SMALL_HEIGHT - CLAWD_STILL_SMALL_H) / 2;
+        lv_obj_set_pos(settings_icon_img, L.margin, top);
+    } else {
+        lv_obj_set_pos(settings_icon_img, L.margin, L.logo_y);
+    }
+    lv_obj_add_flag(settings_icon_img, LV_OBJ_FLAG_HIDDEN);
+    // Tapping the icon while already on Settings backs out to Usage, same
+    // as "< Back" — mirrors tapping the mascot on Usage to get here.
+    // Extended hit area for the same reason as the usage-screen tap zone:
+    // real-finger accuracy on CYD's resistive touch is poor against a
+    // small target (see settings_tap_zone in ui_init()).
+    lv_obj_add_flag(settings_icon_img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(settings_icon_img, 20);
+    lv_obj_add_event_cb(settings_icon_img, settings_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_title2 = lv_label_create(settings_container);
+    lv_label_set_text(lbl_title2, "Settings");
+    // Same font, width, and centering as "Usage"/"Sessions" (lbl_title in
+    // init_usage_screen) — consistent title treatment across every screen.
+    lv_obj_set_style_text_font(lbl_title2, L.title_font, 0);
+    lv_obj_set_style_text_color(lbl_title2, COL_TEXT, 0);
+    lv_label_set_long_mode(lbl_title2, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_width(lbl_title2, LV_PCT(100));
+    lv_obj_set_style_text_align(lbl_title2, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Large tier only: the icon (CLAWD_SETTINGS_H, deliberately much taller
+    // than the title text) floats independently of the flex flow now (see
+    // settings_icon_img above), so unlike the title itself — which is
+    // expected to overlap it, same tradeoff as the usage screen's
+    // mascot/clock overlap — the rows below need explicit reserved space
+    // or the icon covers them.
+    if (!L.small_icons) {
+        lv_obj_t* icon_spacer = lv_obj_create(settings_container);
+        lv_obj_set_size(icon_spacer, 1, CLAWD_SETTINGS_H - L.logo_y);
+        lv_obj_set_style_bg_opa(icon_spacer, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(icon_spacer, 0, 0);
+        lv_obj_set_style_pad_all(icon_spacer, 0, 0);
+        lv_obj_clear_flag(icon_spacer, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    lbl_set_session = make_settings_label(settings_container, "Session: --%", COL_TEXT);
+    lbl_set_weekly  = make_settings_label(settings_container, "Weekly: --%", COL_TEXT);
+    lbl_set_account = make_settings_label(settings_container, "Account: --", COL_DIM);
+
+    lv_obj_t* sep = lv_label_create(settings_container);
+    lv_label_set_text(sep, "");
+    lv_obj_set_height(sep, 4);
+
+    lv_obj_t* fps_row = make_settings_row(settings_container);
+    make_settings_label(fps_row, "FPS", COL_TEXT);
+    lv_obj_t* fps_ctrl = lv_obj_create(fps_row);
+    lv_obj_set_size(fps_ctrl, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(fps_ctrl, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(fps_ctrl, 0, 0);
+    lv_obj_set_style_pad_all(fps_ctrl, 0, 0);
+    lv_obj_clear_flag(fps_ctrl, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(fps_ctrl, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(fps_ctrl, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t* lbl_minus; lv_obj_t* btn_minus = make_settings_button(fps_ctrl, fps_dec_cb, &lbl_minus);
+    lv_label_set_text(lbl_minus, "-");
+    (void)btn_minus;
+    lbl_fps_value = lv_label_create(fps_ctrl);
+    lv_label_set_text_fmt(lbl_fps_value, "%u", settings_get_fps());
+    lv_obj_set_style_text_font(lbl_fps_value, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(lbl_fps_value, COL_TEXT, 0);
+    lv_obj_set_style_pad_hor(lbl_fps_value, 10, 0);
+    lv_obj_t* lbl_plus; lv_obj_t* btn_plus = make_settings_button(fps_ctrl, fps_inc_cb, &lbl_plus);
+    lv_label_set_text(lbl_plus, "+");
+    (void)btn_plus;
+
+    lv_obj_t* transport_row = make_settings_row(settings_container);
+    make_settings_label(transport_row, "Transport", COL_TEXT);
+    make_settings_button(transport_row, transport_cycle_cb, &lbl_transport_value);
+    lv_label_set_text(lbl_transport_value, settings_transport_name(settings_get_transport()));
+
+    lv_obj_t* clock_row = make_settings_row(settings_container);
+    make_settings_label(clock_row, "Clock", COL_TEXT);
+    make_settings_button(clock_row, clockfmt_cycle_cb, &lbl_clockfmt_value);
+    lv_label_set_text_fmt(lbl_clockfmt_value, "%uh", settings_get_clock_format());
+
+    lv_obj_t* back_row = lv_button_create(settings_container);
+    lv_obj_set_width(back_row, LV_PCT(100));
+    lv_obj_set_style_bg_color(back_row, COL_BAR_BG, 0);
+    lv_obj_add_event_cb(back_row, settings_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* lbl_back = lv_label_create(back_row);
+    lv_label_set_text(lbl_back, "< Back");
+    lv_obj_set_style_text_font(lbl_back, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(lbl_back, COL_TEXT, 0);
+    lv_obj_center(lbl_back);
+}
+
+// Keeps the Settings screen's usage summary current even while it isn't the
+// visible screen — cheap (a handful of label sets), same tradeoff the rest
+// of this file already makes for hidden panels.
+static void refresh_settings_usage_labels(void) {
+    const UsageData* d = &s_settings_usage;
+    if (!lbl_set_session) return;
+    lv_label_set_text_fmt(lbl_set_session, "Session: %d%%", (int)(d->session_pct + 0.5f));
+    lv_label_set_text_fmt(lbl_set_weekly, "Weekly: %d%%", (int)(d->weekly_pct + 0.5f));
+    lv_label_set_text(lbl_set_account, d->enterprise ? "Account: Enterprise" : "Account: Pro");
+}
+
+static void open_settings_cb(lv_event_t* e) {
+    (void)e;
+    if (current_screen == SCREEN_USAGE) ui_show_screen(SCREEN_SETTINGS);
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -1585,12 +1841,20 @@ void ui_init(void) {
     // Static corner mascot (see clawd_still.h) — the animated one needs PSRAM.
     if (L.small_icons) init_icon_dsc_rgb565a8(&logo_dsc, CLAWD_STILL_SMALL_W, CLAWD_STILL_SMALL_H, clawd_still_small_data);
     else               init_icon_dsc_rgb565a8(&logo_dsc, CLAWD_STILL_W, CLAWD_STILL_H, clawd_still_data);
+#if BOARD_HAS_SESSION_VIEWS
+    // Only a small-tier asset exists today (see clawd_sessions.h) — the
+    // only board hitting this branch with session views on is CYD.
+    init_icon_dsc_rgb565a8(&sessions_icon_dsc, CLAWD_SESSIONS_SMALL_W, CLAWD_SESSIONS_SMALL_H, clawd_sessions_small_data);
+#endif
 #endif
     init_battery_icons();
     init_conn_icons();
 
     init_usage_screen(scr);
+    init_settings_screen(scr);
     splash_init(scr);
+
+    clock_fmt = settings_get_clock_format();
 
     if (splash_get_root()) {
         lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
@@ -1598,6 +1862,8 @@ void ui_init(void) {
 
     // Corner mascot in the old logo slot. The still Clawd is shorter than the
     // 80/40 px slot the spark logo used; center it vertically in that slot.
+    // Tapping it (rather than the screen at large) opens Settings instead of
+    // toggling the splash screen — see open_settings_cb().
     {
         const int slot  = L.small_icons ? LOGO_SMALL_HEIGHT : LOGO_HEIGHT;
         const int art_h = L.small_icons ? CLAWD_STILL_SMALL_H : CLAWD_STILL_H;
@@ -1611,6 +1877,23 @@ void ui_init(void) {
         lv_obj_set_pos(logo_img, L.margin, top);
 #endif
     }
+
+    // Invisible tap target, well bigger than the visible mascot art itself
+    // (a real tap on a small icon isn't reliable — confirmed on CYD's
+    // resistive touch, where per-pixel accuracy is poor right after a fresh
+    // flash since its self-widening calibration hasn't stretched yet; see
+    // touch.cpp). Covers the top-left corner generously rather than being
+    // sized to the artwork, and works identically for both mascot variants
+    // since it doesn't depend on either one's own bounds.
+    settings_tap_zone = lv_obj_create(scr);
+    lv_obj_set_style_bg_opa(settings_tap_zone, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(settings_tap_zone, 0, 0);
+    lv_obj_set_style_pad_all(settings_tap_zone, 0, 0);
+    lv_obj_clear_flag(settings_tap_zone, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(settings_tap_zone, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_pos(settings_tap_zone, 0, 0);
+    lv_obj_set_size(settings_tap_zone, L.scr_w * 2 / 5, L.scr_h * 7 / 20);
+    lv_obj_add_event_cb(settings_tap_zone, open_settings_cb, LV_EVENT_CLICKED, NULL);
 
     // Transport icons sit left of the battery icon, hugging the corner:
     // [serial][bluetooth][battery]. Uses conn_row_margin (tighter than the
@@ -1653,11 +1936,14 @@ void ui_update(const UsageData* data) {
     if (!data->ok) return;          // a {"ok":false} "no data" beat → fall through to idle, keep last numbers
     last_data_ms = lv_tick_get();   // a real usage update just landed
     data_received = true;
+    s_settings_usage = *data;
+    refresh_settings_usage_labels();
 
     if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
         clock_base_epoch = data->clock_epoch;
         clock_base_ms = last_data_ms;
-        clock_fmt = data->clock_fmt;
+        // clock_fmt is device-owned (Settings screen) — data->clock_fmt (the
+        // daemon's "tf" field) is deliberately not consulted here.
     } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
         clock_base_epoch = 0;
         clock_last_epoch = -1;
@@ -1839,6 +2125,9 @@ static void update_view_state(void) {
     if (chats_group) lv_obj_add_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
     if (v == 3 || v == 4) {
         lv_label_set_text(lbl_title, "Sessions");
+#ifndef BOARD_HAS_PSRAM
+        if (logo_img) lv_image_set_src(logo_img, &sessions_icon_dsc);
+#endif
         if (v == 3) lv_obj_clear_flag(focus_group, LV_OBJ_FLAG_HIDDEN);
         else {
             lv_obj_clear_flag(chats_group, LV_OBJ_FLAG_HIDDEN);
@@ -1854,6 +2143,9 @@ static void update_view_state(void) {
         // Leaving the session view: restore the title now instead of
         // waiting up to a second for the next clock tick to overwrite it.
         lv_label_set_text(lbl_title, "Usage");
+#ifndef BOARD_HAS_PSRAM
+        if (logo_img) lv_image_set_src(logo_img, &logo_dsc);
+#endif
         clock_last_epoch = -1;
         lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
                           LV_OBJ_FLAG_HIDDEN);
@@ -1972,19 +2264,35 @@ static void global_click_cb(lv_event_t* e) {
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(settings_icon_img, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
-    case SCREEN_SPLASH:  splash_show(); break;
-    case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SPLASH:    splash_show(); break;
+    case SCREEN_USAGE:     lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SETTINGS:
+        lv_obj_clear_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(settings_icon_img, LV_OBJ_FLAG_HIDDEN);
+        break;
     default: break;
     }
 
-    splash_mascot_set_visible(screen != SCREEN_SPLASH);
+    // Also hidden on Settings — its own title sits in the same top-left
+    // corner the mascot occupies, and it's the click target that got you
+    // here in the first place, not something Settings itself needs shown.
+    const bool show_mascot = (screen != SCREEN_SPLASH && screen != SCREEN_SETTINGS);
+    splash_mascot_set_visible(show_mascot);
     if (logo_img) {
-        if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-        else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        if (show_mascot) lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
     }
+    // Not just cosmetic: leaving this clickable while hidden-by-screen would
+    // silently swallow taps meant for splash_root's own click handler (LVGL
+    // stops at the first clickable hit, hidden or not doesn't matter unless
+    // HIDDEN is set — see lv_indev_search_obj()).
+    if (show_mascot) lv_obj_clear_flag(settings_tap_zone, LV_OBJ_FLAG_HIDDEN);
+    else              lv_obj_add_flag(settings_tap_zone, LV_OBJ_FLAG_HIDDEN);
 
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;

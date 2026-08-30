@@ -16,6 +16,7 @@
 #include "idle.h"
 #include "idle_cfg.h"
 #include "brightness.h"
+#include "settings.h"
 
 #include "hal/board_caps.h"
 #include "hal/display_hal.h"
@@ -429,6 +430,7 @@ void setup() {
     display_hal_begin();
     idle_init();        // takes over panel brightness and starts the idle timer
     brightness_init();  // load the user's saved brightness level and apply via idle
+    settings_init();    // load fps/clock-format/transport prefs — see Settings screen
 
     power_hal_init();
     imu_hal_init();
@@ -518,7 +520,17 @@ static void pair_tick(void) {
 
 void loop() {
     idle_tick();
-    lv_timer_handler();
+
+    // FPS setting (Settings screen) caps how often LVGL redraws/dispatches
+    // touch input — everything else below still runs every loop() pass.
+    static uint32_t last_frame_ms = 0;
+    uint32_t now_ms = millis();
+    uint32_t frame_interval_ms = 1000 / settings_get_fps();
+    if (now_ms - last_frame_ms >= frame_interval_ms) {
+        last_frame_ms = now_ms;
+        lv_timer_handler();
+    }
+
     ui_tick_anim();
     ble_tick();
     power_hal_tick();
