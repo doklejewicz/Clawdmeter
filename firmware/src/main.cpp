@@ -3,8 +3,10 @@
 #include <lvgl.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
+#ifndef BOARD_SIM
 #include <SPIFFS.h>
 #include <MD5Builder.h>
+#endif
 
 #include "data.h"
 #include "ui.h"
@@ -258,6 +260,11 @@ static void send_screenshot() {
 // make up the shortfall), so a plain length check can't catch this — only
 // a content hash can. Host side must verify and retry; see the bundled
 // bootstrap script.
+//
+// Not built for BOARD_SIM: there's no SPIFFS partition (or any real
+// filesystem) to serve on the native desktop target, and no board to
+// bootstrap a host machine from in the first place.
+#ifndef BOARD_SIM
 static void send_setup_bundle() {
     if (!SPIFFS.begin(false)) {
         Serial.println("SETUP_UNSUPPORTED");
@@ -289,6 +296,7 @@ static void send_setup_bundle() {
     Serial.println();
     Serial.println("SETUP_END");
 }
+#endif  // BOARD_SIM
 
 static void check_serial_cmd() {
     while (Serial.available()) {
@@ -300,7 +308,11 @@ static void check_serial_cmd() {
             } else if (strcmp(cmd_buf, "buzz") == 0) {
                 sound_hal_play_reset();
             } else if (strcmp(cmd_buf, "get-setup") == 0) {
+#ifndef BOARD_SIM
                 send_setup_bundle();
+#else
+                Serial.println("SETUP_UNSUPPORTED");
+#endif
             } else if (strcmp(cmd_buf, "identify") == 0) {
                 Serial.printf("{\"device\":\"Clawdmeter\",\"board\":\"%s\"}\n",
                               board_caps().name);
