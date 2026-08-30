@@ -1615,7 +1615,11 @@ static lv_obj_t* make_settings_row(lv_obj_t* parent) {
     lv_obj_set_height(row, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_set_style_pad_all(row, L.small_icons ? 1 : 4, 0);
+    // Generous vertical padding — bigger tap target per row, easier to hit
+    // with a finger (especially on CYD's imprecise resistive touch) than
+    // the original tightly-packed rows.
+    lv_obj_set_style_pad_ver(row, L.small_icons ? 6 : 8, 0);
+    lv_obj_set_style_pad_hor(row, L.small_icons ? 1 : 4, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -1636,8 +1640,10 @@ static lv_obj_t* make_settings_button(lv_obj_t* parent, lv_event_cb_t cb, lv_obj
     lv_obj_t* btn = lv_button_create(parent);
     lv_obj_set_style_bg_color(btn, COL_BAR_BG, 0);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_hor(btn, L.small_icons ? 8 : 12, 0);
-    lv_obj_set_style_pad_ver(btn, L.small_icons ? 2 : 6, 0);
+    // Generous padding — bigger tap target, easier to hit with a finger
+    // (especially on CYD's imprecise resistive touch).
+    lv_obj_set_style_pad_hor(btn, L.small_icons ? 16 : 22, 0);
+    lv_obj_set_style_pad_ver(btn, L.small_icons ? 6 : 10, 0);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
     *out_label = lv_label_create(btn);
     lv_obj_set_style_text_font(*out_label, L.bt_device_font, 0);
@@ -1682,20 +1688,43 @@ static void settings_back_cb(lv_event_t* e) {
 }
 
 static void init_settings_screen(lv_obj_t* scr) {
+    // "< Back" is a fixed footer, not part of the scrollable list below —
+    // always reachable with one tap regardless of scroll position, rather
+    // than something that could scroll out of view.
+    const int back_h = L.small_icons ? 44 : 60;
+
     settings_container = lv_obj_create(scr);
     lv_obj_set_size(settings_container, L.scr_w, L.scr_h);
     lv_obj_set_pos(settings_container, 0, 0);
     lv_obj_set_style_bg_color(settings_container, COL_BG, 0);
     lv_obj_set_style_bg_opa(settings_container, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(settings_container, 0, 0);
-    lv_obj_set_style_pad_all(settings_container, L.margin, 0);
-    lv_obj_set_style_pad_row(settings_container, L.small_icons ? 2 : 6, 0);
+    lv_obj_set_style_pad_all(settings_container, 0, 0);
+    lv_obj_clear_flag(settings_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t* settings_scroll = lv_obj_create(settings_container);
+    lv_obj_set_size(settings_scroll, L.scr_w, L.scr_h - back_h);
+    lv_obj_set_pos(settings_scroll, 0, 0);
+    lv_obj_set_style_bg_opa(settings_scroll, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(settings_scroll, 0, 0);
+    lv_obj_set_style_pad_all(settings_scroll, L.margin, 0);
+    // Matches lbl_title's own absolute position on the usage screen
+    // (L.title_y, not the general-purpose L.margin) so the "Settings"
+    // title starts at the exact same Y as "Usage"/"Sessions" — same fix
+    // as settings_icon_img's position below, same root cause (a flex
+    // child defaults to the container's general padding, not the more
+    // specific constant the reference screen actually uses).
+    lv_obj_set_style_pad_top(settings_scroll, L.title_y, 0);
+    // Small gap — each row's own padding (see make_settings_row) already
+    // provides the bigger tap target; stacking a large inter-row gap on
+    // top of that made things feel too spread out.
+    lv_obj_set_style_pad_row(settings_scroll, L.small_icons ? 0 : 2, 0);
     // Scrollable rather than hand-fit to every tier — the smallest screens
     // (240x240) can't fit the full list without it, and it costs nothing on
     // the larger tiers where everything already fits.
-    lv_obj_set_scroll_dir(settings_container, LV_DIR_VER);
-    lv_obj_set_flex_flow(settings_container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_scroll_dir(settings_scroll, LV_DIR_VER);
+    lv_obj_set_flex_flow(settings_scroll, LV_FLEX_FLOW_COLUMN);
 
     // Fixed-pixel-size art rendered unscaled looks proportionally far
     // bigger on a small low-res panel than a large one (confirmed on real
@@ -1736,7 +1765,7 @@ static void init_settings_screen(lv_obj_t* scr) {
     lv_obj_set_ext_click_area(settings_icon_img, 20);
     lv_obj_add_event_cb(settings_icon_img, settings_back_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* lbl_title2 = lv_label_create(settings_container);
+    lv_obj_t* lbl_title2 = lv_label_create(settings_scroll);
     lv_label_set_text(lbl_title2, "Settings");
     // Same font, width, and centering as "Usage"/"Sessions" (lbl_title in
     // init_usage_screen) — consistent title treatment across every screen.
@@ -1753,7 +1782,7 @@ static void init_settings_screen(lv_obj_t* scr) {
     // mascot/clock overlap — the rows below need explicit reserved space
     // or the icon covers them.
     if (!L.small_icons) {
-        lv_obj_t* icon_spacer = lv_obj_create(settings_container);
+        lv_obj_t* icon_spacer = lv_obj_create(settings_scroll);
         lv_obj_set_size(icon_spacer, 1, CLAWD_SETTINGS_H - L.logo_y);
         lv_obj_set_style_bg_opa(icon_spacer, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(icon_spacer, 0, 0);
@@ -1761,15 +1790,15 @@ static void init_settings_screen(lv_obj_t* scr) {
         lv_obj_clear_flag(icon_spacer, LV_OBJ_FLAG_SCROLLABLE);
     }
 
-    lbl_set_session = make_settings_label(settings_container, "Session: --%", COL_TEXT);
-    lbl_set_weekly  = make_settings_label(settings_container, "Weekly: --%", COL_TEXT);
-    lbl_set_account = make_settings_label(settings_container, "Account: --", COL_DIM);
+    lbl_set_session = make_settings_label(settings_scroll, "Session: --%", COL_TEXT);
+    lbl_set_weekly  = make_settings_label(settings_scroll, "Weekly: --%", COL_TEXT);
+    lbl_set_account = make_settings_label(settings_scroll, "Account: --", COL_DIM);
 
-    lv_obj_t* sep = lv_label_create(settings_container);
+    lv_obj_t* sep = lv_label_create(settings_scroll);
     lv_label_set_text(sep, "");
     lv_obj_set_height(sep, 4);
 
-    lv_obj_t* fps_row = make_settings_row(settings_container);
+    lv_obj_t* fps_row = make_settings_row(settings_scroll);
     make_settings_label(fps_row, "FPS", COL_TEXT);
     lv_obj_t* fps_ctrl = lv_obj_create(fps_row);
     lv_obj_set_size(fps_ctrl, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -1791,18 +1820,23 @@ static void init_settings_screen(lv_obj_t* scr) {
     lv_label_set_text(lbl_plus, "+");
     (void)btn_plus;
 
-    lv_obj_t* transport_row = make_settings_row(settings_container);
+    lv_obj_t* transport_row = make_settings_row(settings_scroll);
     make_settings_label(transport_row, "Transport", COL_TEXT);
     make_settings_button(transport_row, transport_cycle_cb, &lbl_transport_value);
     lv_label_set_text(lbl_transport_value, settings_transport_name(settings_get_transport()));
 
-    lv_obj_t* clock_row = make_settings_row(settings_container);
+    lv_obj_t* clock_row = make_settings_row(settings_scroll);
     make_settings_label(clock_row, "Clock", COL_TEXT);
     make_settings_button(clock_row, clockfmt_cycle_cb, &lbl_clockfmt_value);
     lv_label_set_text_fmt(lbl_clockfmt_value, "%uh", settings_get_clock_format());
 
+    // Fixed footer, sibling of settings_scroll (not inside it) — always
+    // on-screen at a constant position regardless of scroll offset, per
+    // the user's request that Back never scroll out of reach.
     lv_obj_t* back_row = lv_button_create(settings_container);
-    lv_obj_set_width(back_row, LV_PCT(100));
+    lv_obj_set_size(back_row, L.scr_w, back_h);
+    lv_obj_set_pos(back_row, 0, L.scr_h - back_h);
+    lv_obj_set_style_radius(back_row, 0, 0);
     lv_obj_set_style_bg_color(back_row, COL_BAR_BG, 0);
     lv_obj_add_event_cb(back_row, settings_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t* lbl_back = lv_label_create(back_row);
