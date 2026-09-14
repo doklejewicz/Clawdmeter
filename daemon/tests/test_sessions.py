@@ -997,3 +997,36 @@ def test_sweep_discovery_does_not_duplicate_on_repeat(tmp_path):
     clock.tick(5.0)
     assert t.sweep() is False          # already known, alive, nothing changed
     assert len(t.sessions) == 1
+
+
+def test_sweep_retries_context_after_a_lost_refresh_race(tmp_path):
+    # The hook-triggered refresh (SessionStart/Stop/PostCompact) can race
+    # the transcript's own write — the hook reaches the sidecar over HTTP at
+    # essentially the same instant the CLI flushes the turn's assistant
+    # record to disk, and occasionally the read loses that race and finds
+    # nothing yet. A session's FIRST refresh has no prior good value to fall
+    # back to (ctx/tok/model/effort are sticky on a failed read), so losing
+    # that race left it stuck at "unknown" forever, with nothing to trigger
+    # a retry, before this fix.
+    clock = FakeClock(1000.0)
+    cwd = "/home/x/clawdmeter"
+    t = SessionTable(config_dirs=[str(tmp_path)], now_fn=clock)
+    _write_roster(tmp_path, SID, os.getpid(), cwd=cwd)
+
+    # Stop fires before the transcript write has landed -> nothing to read yet.
+    t.handle_event(ev("Stop", cwd=cwd))
+    assert sess(t).ctx == -1
+
+    # The write lands a moment later — the actual race being modeled.
+    _write_transcript(tmp_path, cwd, SID, [
+        {"type": "assistant", "isSidechain": False,
+         "message": {"model": "claude-sonnet-4-5",
+                     "usage": {"input_tokens": 40_000}},
+         "effort": "high"},
+    ])
+
+    # Next sweep (every ~5s in production) retries and picks it up.
+    clock.tick(5.0)
+    assert t.sweep() is True
+    assert sess(t).ctx != -1
+    assert sess(t).effort == effort_code("high")

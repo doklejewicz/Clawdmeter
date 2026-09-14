@@ -1043,6 +1043,24 @@ class SessionTable:
                         sess.roster_name = name
                         sess.roster_name_source = src if isinstance(src, str) else None
                         changed = True
+                    if sess.ctx == -1:
+                        # A hook-triggered refresh (SessionStart/Stop/
+                        # PostCompact) can race the transcript's own write —
+                        # the hook reaches us over HTTP at essentially the
+                        # same instant the CLI flushes the turn's assistant
+                        # record to disk, and occasionally the read loses
+                        # that race and finds nothing yet. ctx/tok/model/
+                        # effort are sticky on a failed read (don't regress a
+                        # known-good value), which is right once a session
+                        # HAS a good value — but a session's very first
+                        # refresh has none to fall back to, so a lost race
+                        # there leaves it stuck at "unknown" until some other
+                        # event happens to land cleanly. Retrying here every
+                        # sweep (~5s) self-heals that within one cycle
+                        # instead of waiting on chance.
+                        self._refresh_context(sess)
+                        if sess.ctx != -1:
+                            changed = True
                 else:
                     if sess.missing_since is None:
                         sess.missing_since = now  # grace starts; not wire-visible
