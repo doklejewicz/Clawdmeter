@@ -300,6 +300,16 @@ def test_bucket_mapping():
     assert state_bucket(STATE_STARTING) == 2
 
 
+def test_bucket_mapping_nagents_override():
+    # A background subagent still running keeps an otherwise-idle session
+    # out of the idle bucket — it's not done, even if the main thread is.
+    assert state_bucket(STATE_IDLE, nagents=1) == 1
+    assert state_bucket(STATE_STARTING, nagents=2) == 1
+    assert state_bucket(STATE_IDLE, nagents=0) == 2
+    # Waiting still outranks a background agent — the user needs to act.
+    assert state_bucket(STATE_WAITING_PERMISSION, nagents=3) == 0
+
+
 # ---------------------------------------------------------------------------
 # Label eliding — §5 fitting rule 1
 # ---------------------------------------------------------------------------
@@ -446,6 +456,39 @@ def test_context_unknown_when_transcript_missing():
     assert sess(t).tok == -1    # tok is -1 exactly when ctx is -1
 
 
+def test_refresh_falls_back_when_reported_path_is_unreachable(tmp_path):
+    # A devcontainer's hooks report transcript_path from ITS OWN filesystem
+    # view (e.g. "/home/uv-user/.claude/projects/...", a bind-mounted path
+    # this host's sidecar doesn't share) — that path never exists here. Once
+    # any live hook event overwrites sess.transcript_path with it, every
+    # future _refresh_context() call must not just silently keep using that
+    # dead path forever (frozen-stale ctx/tok/model/effort, since a failed
+    # read is now sticky) — it should notice the reported path isn't
+    # readable and fall back to the host-relative guess instead.
+    cwd = "/home/uv-user/src"
+    munged = mod.munge_cwd(cwd)
+    real_dir = tmp_path / "projects" / munged
+    real_dir.mkdir(parents=True)
+    real_path = real_dir / f"{SID}.jsonl"
+    rec = {"type": "assistant", "isSidechain": False,
+           "message": {"model": "claude-sonnet-4-5",
+                       "usage": {"input_tokens": 50_000}},
+           "effort": "max"}
+    real_path.write_text(json.dumps(rec) + "\n")
+
+    t = make_table(config_dirs=[str(tmp_path)])
+    t.handle_event(ev("SessionStart", cwd=cwd))  # no transcript_path -> guesses correctly
+    assert sess(t).ctx != -1
+    assert sess(t).effort == effort_code("max")
+
+    container_path = "/home/uv-user/.claude/projects/x/y.jsonl"
+    t.handle_event(ev("UserPromptSubmit", cwd=cwd, transcript_path=container_path,
+                       prompt="hi"))
+    t.handle_event(ev("Stop", cwd=cwd, transcript_path=container_path))
+    assert sess(t).ctx != -1
+    assert sess(t).effort == effort_code("max")
+
+
 def test_read_custom_title_picks_the_latest(tmp_path):
     transcript = tmp_path / "t.jsonl"
     lines = [
@@ -554,10 +597,19 @@ def test_tok_known_ctx_correct_k_value(tmp_path):
 def test_tok_and_ctx_come_from_the_same_read(tmp_path):
     t = _table_with_transcript(tmp_path, 100_000)
     assert (sess(t).ctx, sess(t).tok) == (50, 100)
-    # transcript disappears; Stop triggers a re-read -> both go unknown together
+    # transcript disappears; Stop triggers a re-read that finds nothing —
+    # ctx/tok are sticky like model/effort (see _refresh_context), so a read
+    # that comes back empty keeps the last known pair instead of wiping it.
+    # A prior version reset both to (-1, -1) here, but that same code path
+    # also fires on a merely-transient miss (racing an in-flight transcript
+    # write, or a burst of non-assistant records pushing the last real one
+    # outside the tail-read window) during completely normal, ongoing
+    # sessions — which was flickering a session's context % back to
+    # "unknown" for no real reason. They still agree with each other,
+    # which is the actual property this test is named for.
     os.remove(sess(t).transcript_path)
     t.handle_event(ev("Stop"))
-    assert (sess(t).ctx, sess(t).tok) == (-1, -1)
+    assert (sess(t).ctx, sess(t).tok) == (50, 100)
 
 
 def test_tok_on_the_wire_at_index_11(tmp_path):

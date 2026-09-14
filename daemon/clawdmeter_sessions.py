@@ -234,11 +234,18 @@ def read_hook_trust_binds(path=None):
 # Pure helpers (unit-tested)
 # ---------------------------------------------------------------------------
 
-def state_bucket(state):
-    """§2.2: 0 waiting, 1 working, 2 idle. Sort key is (bucket, -last_event_at)."""
+def state_bucket(state, nagents=0):
+    """§2.2: 0 waiting, 1 working, 2 idle. Sort key is (bucket, -last_event_at).
+    A subagent spawned in the background doesn't block the main thread's own
+    turn — it can fire Stop (state -> IDLE) and reply while the subagent it
+    kicked off keeps running independently. Without nagents here, that
+    session would sink to the idle bucket (bottom of a multi-card screen)
+    while genuinely still doing something; waiting still outranks it (the
+    user needs to act on a permission/question regardless of background
+    agents), but idle does not."""
     if state in WAITING_STATES:
         return 0
-    if state in WORKING_STATES:
+    if state in WORKING_STATES or nagents > 0:
         return 1
     return 2
 
@@ -932,7 +939,23 @@ class SessionTable:
     # -- context (§4.3): hook-driven re-reads, never polled ------------------
 
     def _refresh_context(self, sess):
-        path = sess.transcript_path or self._guess_transcript(sess)
+        # sess.transcript_path comes straight from the hook payload's own
+        # report of its path — normally trustworthy and preferred over
+        # _guess_transcript()'s munged-cwd reconstruction, since a resumed
+        # session's real transcript can differ from what that guess would
+        # produce. But a devcontainer's hook payload reports its OWN
+        # filesystem view (e.g. "/home/uv-user/.claude/projects/...", a
+        # bind-mounted path this host's sidecar doesn't share) — that path
+        # never exists here, so once any live hook event overwrites it, every
+        # future read of this session would silently fail forever (frozen
+        # stale values, given ctx/tok/model/effort are sticky on a failed
+        # read). Falling back to the host-relative guess whenever the
+        # hook-reported path isn't actually readable from here fixes both
+        # the plain-host case (unaffected, its own path is always valid) and
+        # the devcontainer case (transparently uses the correct host path).
+        path = sess.transcript_path
+        if not path or not os.path.isfile(path):
+            path = self._guess_transcript(sess)
         if not path:
             return
         # Backfill from history on the first call we can (normally
@@ -1069,7 +1092,7 @@ class SessionTable:
         with self._lock:
             ordered = sorted(
                 (s for s in self.sessions.values() if not s.is_placeholder()),
-                key=lambda s: (state_bucket(s.state), -s.last_event_at),
+                key=lambda s: (state_bucket(s.state, s.nagents), -s.last_event_at),
             )
             return [
                 [
