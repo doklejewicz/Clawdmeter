@@ -34,7 +34,9 @@ Python 3 stdlib only — no pip installs required.
 """
 
 import argparse
+import glob
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -172,12 +174,18 @@ def read_config_value(key, path=None):
 
 
 def read_config_dirs(path=None):
-    """Claude config dirs to consult for rosters/transcripts (default ~/.claude)."""
+    """Claude config dirs to consult for rosters/transcripts (default ~/.claude).
+
+    Entries containing glob metacharacters (e.g. "~/.claude*") are expanded
+    against the filesystem and filtered to directories; unmatched patterns
+    contribute nothing (not a literal, un-expanded string).
+    """
     raw = read_config_value("config_dirs", path)
     home = os.path.expanduser("~")
     if not raw:
         return [os.path.join(home, ".claude")]
     dirs = []
+    seen = set()
     for part in raw.split(","):
         part = part.strip()
         if not part:
@@ -186,8 +194,40 @@ def read_config_dirs(path=None):
             part = home
         elif part.startswith("~/"):
             part = os.path.join(home, part[2:])
-        dirs.append(part)
+        if any(ch in part for ch in "*?["):
+            for match in sorted(glob.glob(part)):
+                if os.path.isdir(match) and match not in seen:
+                    dirs.append(match)
+                    seen.add(match)
+        elif part not in seen:
+            dirs.append(part)
+            seen.add(part)
     return dirs or [os.path.join(home, ".claude")]
+
+
+def read_hook_trust_binds(path=None):
+    """Extra listeners for `hook_trust_bind`: comma-separated 'ip/prefixlen'
+    entries (e.g. a Docker bridge gateway + its subnet, "172.18.0.1/16").
+    Each gets its own HookServer bound to that ip, trusting peers from that
+    CIDR alongside the primary loopback-only listener — for a devcontainer
+    that can't reach 127.0.0.1 on the host (different netns) but shouldn't
+    be handed the same trust as `network_mode: host` either. Unset (default)
+    = no extra listener, unchanged loopback-only behavior. See SESSIONS.md."""
+    raw = read_config_value("hook_trust_bind", path)
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            iface = ipaddress.ip_interface(part)
+        except ValueError:
+            log(f"ignoring invalid hook_trust_bind entry '{part}'")
+            continue
+        out.append((str(iface.ip), iface.network))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -508,11 +548,63 @@ def _proc_starttime(pid):
         return None
 
 
+def _find_namespaced_pid(pid, proc_start):
+    """A roster pid recorded from inside a container's own PID namespace
+    (no --pid=host) never matches /proc/<pid> directly on the host — that
+    number was assigned independently inside the container, and may not
+    even exist as a host pid, or may collide with an unrelated one. But
+    /proc/<host-pid>/status' NSpid line lists a process's pid as seen from
+    every nesting level, outermost (host) first, innermost (its own
+    namespace) last; and starttime (field 22 of /proc/<pid>/stat, jiffies
+    since boot) is a real kernel value, not virtualized per namespace, so
+    it's identical seen from the host or from inside the container. Scan
+    /proc for a host pid whose innermost NSpid equals the roster's pid AND
+    whose starttime equals the roster's procStart, and return that host pid.
+    Confirmed against a real devcontainer (NSpid "12329 2249", starttime
+    "9344" from both the host and the container's own view) — see the
+    session where this was verified for oceanus/optibarrier-ui without
+    needing pid: host in their compose files."""
+    try:
+        candidates = os.listdir("/proc")
+    except OSError:
+        return None
+    want_pid = str(pid)
+    want_start = str(proc_start) if proc_start is not None else None
+    for name in candidates:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/status", "rb") as fh:
+                nspid_line = None
+                for line in fh:
+                    if line.startswith(b"NSpid:"):
+                        nspid_line = line
+                        break
+        except OSError:
+            continue
+        if not nspid_line:
+            continue
+        fields = nspid_line.split()[1:]
+        if len(fields) < 2 or fields[-1].decode("ascii", "replace") != want_pid:
+            continue  # not namespaced (len 1), or wrong innermost pid
+        start = _proc_starttime(name)
+        if start is None:
+            continue
+        if want_start is not None and start != want_start:
+            continue
+        return name
+    return None
+
+
 def pid_alive(pid, proc_start=None):
     """Is this roster entry's process still running? Roster files can outlive a
     crashed process, so presence alone isn't liveness. The roster records
     procStart (jiffies, /proc/<pid>/stat field 22) precisely so pid reuse can
-    be told apart from the original process."""
+    be told apart from the original process. A roster entry written from
+    inside a devcontainer without --pid=host won't match /proc/<pid> directly
+    (different PID namespace) — _find_namespaced_pid() is the fallback for
+    that case, so liveness works without needing pid: host in every compose
+    file (see daemon/SESSIONS.md)."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -521,11 +613,9 @@ def pid_alive(pid, proc_start=None):
         return False
     if os.path.isdir("/proc"):
         start = _proc_starttime(pid)
-        if start is None:
-            return False
-        if proc_start is not None and str(proc_start) != start:
-            return False  # pid was reused by another process
-        return True
+        if start is not None and (proc_start is None or str(proc_start) == start):
+            return True
+        return _find_namespaced_pid(pid, proc_start) is not None
     try:
         os.kill(pid, 0)
         return True
@@ -863,11 +953,23 @@ class SessionTable:
             sess.model = model_code(model_str)
         if effort_str:
             sess.effort = effort_code(effort_str)
-        sess.ctx = context_percent(tokens, model_str, self.pinned_window_k)
-        # tok mirrors the SAME read: the same token sum in 1k units, not divided
-        # by the window. Forced to -1 whenever ctx is -1 so the pair can never
-        # disagree on the wire.
-        sess.tok = tokens_k(tokens) if sess.ctx != -1 else -1
+        # Sticky like model/effort above: tokens is None only when this
+        # particular read found no qualifying assistant+usage record in the
+        # tail window (e.g. the newest turn's write hadn't landed yet, or a
+        # run of non-assistant records pushed the last real one outside
+        # TRANSCRIPT_TAIL_BYTES) — a transient miss, not evidence the
+        # session's context is actually unknown. Unconditionally overwriting
+        # ctx/tok here would wipe a perfectly good prior reading back to -1
+        # on every such miss, with no future refresh able to fix it if the
+        # next one misses too (context % is not monotonic, so a later dip in
+        # source doesn't need to "recover" anything — it just shouldn't be
+        # clobbered by a read that found nothing at all).
+        if tokens is not None:
+            sess.ctx = context_percent(tokens, model_str, self.pinned_window_k)
+            # tok mirrors the SAME read: the same token sum in 1k units, not
+            # divided by the window. Forced to -1 whenever ctx is -1 so the
+            # pair can never disagree on the wire.
+            sess.tok = tokens_k(tokens) if sess.ctx != -1 else -1
         title = read_custom_title_from_transcript(path)
         if title:
             sess.custom_title = title
@@ -1011,18 +1113,21 @@ def write_sessions_file(path, payload):
 
 
 # ---------------------------------------------------------------------------
-# HTTP listener — loopback only, read-only observer
+# HTTP listener — loopback only by default, read-only observer. A server
+# constructed with trusted_network also accepts peers from that CIDR (see
+# hook_trust_bind / read_hook_trust_binds above).
 # ---------------------------------------------------------------------------
 
 class HookServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, table, sessions_file, budget):
+    def __init__(self, addr, table, sessions_file, budget, trusted_network=None):
         super().__init__(addr, HookHandler)
         self.table = table
         self.sessions_file = sessions_file
         self.budget = budget
+        self.trusted_network = trusted_network
         self._publish_lock = threading.Lock()
         self._last_payload = None
 
@@ -1042,8 +1147,17 @@ class HookHandler(BaseHTTPRequestHandler):
     server_version = "ClawdmeterSessions/1"
     protocol_version = "HTTP/1.1"
 
-    def _is_loopback(self):
-        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+    def _is_trusted(self):
+        peer = self.client_address[0]
+        if peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            return True
+        net = self.server.trusted_network
+        if net is None:
+            return False
+        try:
+            return ipaddress.ip_address(peer) in net
+        except ValueError:
+            return False
 
     def _read_body(self):
         try:
@@ -1064,7 +1178,7 @@ class HookHandler(BaseHTTPRequestHandler):
         return body
 
     def do_POST(self):
-        if not self._is_loopback():
+        if not self._is_trusted():
             self.send_error(403)
             return
         body = self._read_body()
@@ -1082,7 +1196,7 @@ class HookHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # Loopback debugging aid: current wire payload.
-        if not self._is_loopback():
+        if not self._is_trusted():
             self.send_error(403)
             return
         body = self.server.table.project(self.server.budget).encode("utf-8")
@@ -1236,16 +1350,38 @@ def main(argv=None):
     bound_port = server.server_address[1]
     log(f"listening on http://127.0.0.1:{bound_port}/ "
         f"(budget {budget} bytes -> {sessions_file})")
+
+    extra_servers = []
+    for bind_ip, network in read_hook_trust_binds(config_path):
+        try:
+            extra = HookServer((bind_ip, bound_port), table, sessions_file, budget,
+                                trusted_network=network)
+        except OSError as exc:
+            log(f"cannot bind {bind_ip}:{bound_port} for hook_trust_bind {network}: {exc}")
+            continue
+        extra_servers.append(extra)
+        log(f"listening on http://{bind_ip}:{bound_port}/ trusting peers from {network} "
+            f"(hook_trust_bind)")
+
     server.publish()  # start from a clean, current file (clears stale sessions)
 
     stop_event = threading.Event()
     sweeper = threading.Thread(target=_sweeper, args=(server, stop_event), daemon=True)
     sweeper.start()
 
+    extra_threads = [
+        threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True)
+        for s in extra_servers
+    ]
+    for t in extra_threads:
+        t.start()
+
     def _shutdown(signum, frame):
         log("shutting down")
         stop_event.set()
         threading.Thread(target=server.shutdown, daemon=True).start()
+        for s in extra_servers:
+            threading.Thread(target=s.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -1254,6 +1390,8 @@ def main(argv=None):
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
+        for s in extra_servers:
+            s.server_close()
     return 0
 
 

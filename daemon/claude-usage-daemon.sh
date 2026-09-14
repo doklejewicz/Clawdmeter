@@ -54,7 +54,11 @@ Config file: ~/.config/claude-usage-monitor/config ("key = value" per line,
                          as a Clawdmeter.
 
   config_dirs           Comma-separated Claude config dirs to poll/watch.
-                         Default: ~/.claude. Supports "~" and "~/...".
+                         Default: ~/.claude. Supports "~" and "~/...", and
+                         glob patterns (e.g. "~/.claude*" to pick up every
+                         ~/.claude-* dir alongside ~/.claude without listing
+                         each by name — unmatched patterns just contribute
+                         nothing).
                          Multiple dirs let one device show several
                          accounts/projects at once WITHOUT merging their
                          data — each dir keeps its own separate credentials,
@@ -200,7 +204,12 @@ POLL_SEQ=0              # monotonic poll counter — recency ordering that's imm
 
 # Read the `config_dirs` option: a comma-separated list of Claude config dirs.
 # Defaults to "~/.claude" so existing single-plan setups are unchanged. Tildes
-# and $HOME are expanded; blanks trimmed. Echoes one resolved dir per line.
+# and $HOME are expanded; blanks trimmed. An entry containing a glob
+# metacharacter (*, ?, [) is expanded against the filesystem and filtered to
+# directories that exist right now (e.g. "~/.claude*" picks up
+# ~/.claude-clientA alongside ~/.claude without listing each by name; an
+# unmatched pattern contributes nothing, never a literal un-expanded string).
+# Duplicates across entries are dropped. Echoes one resolved dir per line.
 read_config_dirs() {
     local raw=""
     if [ -f "$CONFIG_FILE" ]; then
@@ -210,7 +219,9 @@ read_config_dirs() {
     fi
     [ -z "$raw" ] && raw="$HOME/.claude"
     local IFS=','
-    local d
+    local d g
+    local -a out=()
+    local -A seen=()
     for d in $raw; do
         d=$(echo "$d" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
         [ -z "$d" ] && continue
@@ -218,8 +229,26 @@ read_config_dirs() {
             "~")   d="$HOME" ;;
             "~/"*) d="$HOME/${d#\~/}" ;;
         esac
-        echo "$d"
+        case "$d" in
+            *[\*\?\[]*)
+                shopt -s nullglob
+                for g in $d; do
+                    if [ -d "$g" ] && [ -z "${seen[$g]:-}" ]; then
+                        out+=("$g")
+                        seen[$g]=1
+                    fi
+                done
+                shopt -u nullglob
+                ;;
+            *)
+                if [ -z "${seen[$d]:-}" ]; then
+                    out+=("$d")
+                    seen[$d]=1
+                fi
+                ;;
+        esac
     done
+    ((${#out[@]})) && printf '%s\n' "${out[@]}"
 }
 
 # Read the OAuth access token from a specific config dir's credentials file.

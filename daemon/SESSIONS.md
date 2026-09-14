@@ -142,36 +142,48 @@ fields only ever go on the end.
 | `hook_port` | unset | Loopback port for the hook listener. **Unset = feature off** — the sidecar exits, the daemon sends nothing. |
 | `context_window_k` | unset | Pin the context window in kilotokens (e.g. `200`, `1000`). Blank = heuristic: 200k default, 1M on a `[1m]` model marker, snap up to the next 1M multiple when observed usage exceeds the assumption. A pinned value disables the snap-up. |
 | `sessions_budget_bytes` | `400` | Byte budget for the fitted payload. Labels truncate (prefix + "...") down to an 8-char floor first, then the least-urgent rows drop from the tail. Keep below the BLE MTU the device negotiates (the firmware requests 517; 400 leaves headroom under that). |
+| `hook_trust_bind` | unset | Comma-separated `ip/prefixlen` entries (e.g. `172.18.0.1/16`, a Docker bridge gateway + subnet). Each gets its own extra hook listener bound to that ip, trusting peers from that CIDR — for a devcontainer on its own bridge network (not `network_mode: host`) that can't reach `127.0.0.1` on the host. Narrower than `--network=host`: only that specific subnet is trusted, not "any process on the host network." See "Reaching the sidecar without `--network=host`" below. |
 
 The sidecar also honors `config_dirs` (shared with the daemons) to find session
-rosters and transcripts across several Claude config dirs.
+rosters and transcripts across several Claude config dirs. Entries may be a
+glob pattern (e.g. `~/.claude*`) instead of a literal path — it's expanded
+against the filesystem and filtered to directories that exist right now, so
+`~/.claude*` picks up `~/.claude-clientA`/`~/.claude-clientB` alongside
+`~/.claude` without listing each by name. An unmatched pattern contributes
+nothing (never a literal, un-expanded string), and duplicates across entries
+are dropped.
 
 ## Docker / devcontainer sessions
 
-Claude Code running inside a container can show up here too, with **no code
-changes** — the sidecar already reads rosters/transcripts from plain files and
-listens for hooks over plain loopback HTTP; a container just needs to be
-configured so those things actually reach it the way a host process's already
-do:
+Claude Code running inside a container can show up here too, with **no
+compose/devcontainer changes required** for the common case — just a bind
+mount:
 
-1. **Hook connectivity.** The listener binds `127.0.0.1` only (see Privacy
-   below), and a container's `127.0.0.1` is its *own* loopback, not the
-   host's. Run the container with `--network=host` (Linux-only) so they're
-   the same interface — hooks then reach the sidecar with no proxying.
-2. **Correct liveness.** `pid_alive()` reads `/proc/<pid>/stat` — a PID
-   recorded inside a container's own PID namespace doesn't correspond to
-   that same process on the host, so liveness would read wrong (or match an
-   unrelated host process reusing the number). Run with `--pid=host` so the
-   container's processes carry their real host PIDs.
-3. **Visible config.** Bind-mount a Claude config dir into the container at
+1. **Visible config.** Bind-mount a Claude config dir into the container at
    its normal `~/.claude` path, and add that dir (from the *host's* path to
    it) to `config_dirs`.
+2. **Liveness just works**, even without `--pid=host`. `pid_alive()` first
+   tries a direct `/proc/<pid>/stat` match (the host-process case); if that
+   fails, it falls back to scanning `/proc/*/status`' `NSpid` line — which
+   lists a process's pid at every namespace nesting level, host first,
+   innermost (container's own view) last — for a host pid whose innermost
+   entry matches the roster's recorded pid *and* whose `starttime` (field 22,
+   jiffies since boot — a real kernel value, not virtualized per namespace)
+   matches the roster's `procStart`. That pair is enough to uniquely identify
+   the real host-side process without sharing a PID namespace at all.
+3. **Hook connectivity still needs a real network path** — a container's
+   `127.0.0.1` is its own loopback, not the host's, so hooks (`PreToolUse`,
+   `Stop`, etc. — the *live* per-event detail: current tool, todo counts)
+   won't reach the sidecar over a plain bridge network. Either run the
+   container with `--network=host` (Linux-only; simplest, but see the
+   firewall-script caveat below), or use `hook_trust_bind` (below) to trust
+   one specific Docker subnet without full host networking.
 
-Example `devcontainer.json`:
+Example `devcontainer.json` (bind mount only — no `runArgs` needed for
+liveness; `--network=host` is only needed for hook delivery, see below):
 
 ```jsonc
 {
-  "runArgs": ["--network=host", "--pid=host"],
   "mounts": [
     "source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"
   ]
@@ -194,6 +206,13 @@ of the underlying data):
 config_dirs = ~/.claude, ~/.claude-clientA, ~/.claude-clientB
 ```
 
+or, equivalently, with a wildcard that also picks up any future `~/.claude-*`
+dir without an edit:
+
+```ini
+config_dirs = ~/.claude*
+```
+
 Running `claude` directly (no container) against a specific dir works the
 same way, just simpler — no mount needed:
 
@@ -201,11 +220,40 @@ same way, just simpler — no mount needed:
 CLAUDE_CONFIG_DIR=~/.claude-clientA claude
 ```
 
+### Reaching the sidecar without `--network=host`
+
+`--network=host` isn't always an option — a devcontainer may run a
+`postStartCommand` that manages its **own** iptables (an egress-allowlist
+firewall script, say), and `--network=host` would then point that script at
+the *host's* real firewall instead of an isolated container namespace, since
+it no longer has one. In that case, keep the container on its normal bridge
+network and use `hook_trust_bind` instead:
+
+1. Find the bridge network's gateway: `docker network inspect <network> --format '{{json .IPAM.Config}}'` (e.g. `{"Subnet":"172.18.0.0/16","Gateway":"172.18.0.1"}`).
+2. Add `hook_trust_bind = 172.18.0.1/16` to the daemon config — this binds an
+   *additional* listener on that gateway ip, trusting only peers from that
+   subnet, alongside the always-on `127.0.0.1`-only listener host sessions use.
+   No `runArgs`/compose changes needed — liveness already works without
+   `--pid=host` (above), and this doesn't touch networking on the container
+   side either, just adds a second listener on the host.
+3. Point that container's own `settings.json` hook URLs at the gateway ip
+   instead of `127.0.0.1` (e.g. `http://172.18.0.1:<hook_port>/`) — a config
+   dir used exclusively by one container can safely hardcode this, since
+   nothing else reads that `settings.json`.
+
+This trusts an entire Docker subnet rather than one PID, so still prefer
+`--network=host` when nothing else on that network namespace matters and
+no `postStartCommand` there manages the network's own firewall rules.
+
 ## Notes
 
 - **Privacy/security.** Hook payloads contain prompt and response text, so the
-  listener binds `127.0.0.1` only and rejects non-loopback peers. The one
-  exception to "no payload text reaches the device": each session's label,
+  listener binds `127.0.0.1` only and rejects non-loopback peers, by default.
+  `hook_trust_bind` (see above) is an opt-in, per-entry exception to that —
+  each configured subnet gets its own extra listener and is trusted just like
+  loopback, so only add subnets you actually trust (a Docker network that's
+  only your own containers, not something shared with untrusted tenants). The
+  one exception to "no payload text reaches the device" at all: each session's label,
   in priority order, is (1) a custom title you set by renaming the chat in
   the editor's session list, (2) an `ai-title` — a short summary the editor
   generates on its own as the conversation develops, refined over time (e.g.
