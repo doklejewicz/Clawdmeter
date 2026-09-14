@@ -8,7 +8,7 @@ It runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/es
 busier when your usage rate climbs. The two side buttons send Space and
 Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
-![Usage meter](assets/demo.jpeg)
+<img width="1179" height="994" alt="Usage meter" src="https://github.com/user-attachments/assets/83e54aea-0932-428f-94aa-b3ede3a360aa" />
 
 ## Screens
 
@@ -53,8 +53,9 @@ The macOS host pieces — Python daemon, LaunchAgent, and flash helper — were 
 ### Flash the firmware
 
 ```bash
-./flash-mac.sh waveshare_amoled_216                       # auto-detects /dev/cu.usbmodem*
-./flash-mac.sh waveshare_amoled_18  /dev/cu.usbmodem1101  # or pass an explicit USB serial port
+./flash-mac.sh waveshare_amoled_216                       # ESP32-S3 2.16" (auto-detects /dev/cu.usbmodem*)
+./flash-mac.sh waveshare_amoled_216_c6                    # ESP32-C6 2.16" variant
+./flash-mac.sh waveshare_amoled_18  /dev/cu.usbmodem1101  # ESP32-S3 1.8" (or pass an explicit USB serial port)
 ```
 
 The board env name is required. Run `./flash-mac.sh` with no args to see the available envs (scraped from `firmware/platformio.ini`).
@@ -87,8 +88,9 @@ launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist # st
 ### Flash the firmware
 
 ```bash
-./flash.sh waveshare_amoled_216                  # defaults to /dev/ttyACM0
-./flash.sh waveshare_amoled_18  /dev/ttyACM1     # or pass an explicit USB serial port
+./flash.sh waveshare_amoled_216                  # ESP32-S3 2.16" (defaults to /dev/ttyACM0)
+./flash.sh waveshare_amoled_216_c6               # ESP32-C6 2.16" variant
+./flash.sh waveshare_amoled_18  /dev/ttyACM1     # ESP32-S3 1.8" (or pass an explicit USB serial port)
 ```
 
 The board env name is required. Run `./flash.sh` with no args to see the available envs (scraped from `firmware/platformio.ini`).
